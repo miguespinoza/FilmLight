@@ -116,3 +116,7 @@ cancellation must ensure the camera cannot expose later under another color.
 `CameraClient` supplies this adapter through the x64 `FilmLight.CameraHost`.
 Without a connected camera, the existing timer-only sequence remains available.
 No Fujifilm binaries are included.
+
+## License
+
+MIT. See [LICENSE](LICENSE). The Fujifilm SDK is not covered and must be obtained separately under Fujifilm's terms.
