@@ -52,9 +52,10 @@ public static class ShotIdentity
         if (!Slice(maker, 0, 8).SequenceEqual("FUJIFILM"u8))
             throw new InvalidDataException("Unexpected MakerNote manufacturer.");
         var sequenceEntry = Entry(maker, CheckedOffset(U32(maker, 8)), 0x1438);
-        if (U16(sequenceEntry, 2) != 4 || U32(sequenceEntry, 4) != 1)
+        var type = U16(sequenceEntry, 2);
+        if (type is not (3 or 4) || U32(sequenceEntry, 4) != 1)
             throw new InvalidDataException("Unexpected Fujifilm shot-number type.");
-        return U32(sequenceEntry, 8);
+        return type == 3 ? U16(sequenceEntry, 8) : U32(sequenceEntry, 8);
     }
 
     private static ReadOnlySpan<byte> Entry(ReadOnlySpan<byte> data, int offset, ushort tag)

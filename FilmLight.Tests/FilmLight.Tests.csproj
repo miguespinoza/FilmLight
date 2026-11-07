@@ -13,5 +13,6 @@
     <PackageReference Include="Microsoft.Extensions.TimeProvider.Testing" Version="10.0.0" />
     <ProjectReference Include="..\FilmLight.Core\FilmLight.Core.csproj" />
     <ProjectReference Include="..\FilmLight.Fujifilm\FilmLight.Fujifilm.csproj" />
+    <ProjectReference Include="..\FilmLight.Workflow\FilmLight.Workflow.csproj" />
   </ItemGroup>
 </Project>

@@ -51,6 +51,8 @@ Connected RGB mode shows **AUTO** instead of interval controls. After the countd
 the app settles each color for 250 ms, performs half/full press, waits for the
 camera queue, and downloads the complete selected format set before the next color.
 RAW/JPEG partners are checked against their Fujifilm MakerNote shot number.
+Both SHORT and LONG shot-number encodings are supported, including the X-T5's
+SHORT encoding.
 White mode also offers **Capture white**.
 
 Completed transactions appear under `Scan-<id>` in the save folder. Each channel has
@@ -76,6 +78,88 @@ the app or repository. Obtain the applicable redistribution agreement before
 shipping SDK binaries. Logs are under `%LOCALAPPDATA%\FilmLight\Logs`.
 See `docs\fujifilm-sdk-investigation.md` for primary-source references and remaining
 hardware acceptance gates.
+
+## Roll workflow
+
+Open **Roll workflow** after connecting a camera, or explicitly select **Demo camera**
+to try the entire workflow without hardware. Demo windows, files, previews and
+exports stay labelled **DEMO / SYNTHETIC**; the synthetic renderer is never a fallback
+for real captures.
+
+Choose the film kind and White or RGB mode, then **New roll** and a parent folder.
+The app creates a uniquely named roll folder. The capture mode is fixed after the
+first reference; use separate rolls for different modes.
+
+1. **References:** capture **NO-FILM** illumination, then a **FILM BASE** reference
+   using clear/unexposed developed film. Positive/reversal film needs no film-base
+   reference. RGB references contain three separate exposures. Keep camera exposure,
+   white balance, focus, display brightness, geometry and lighting fixed.
+2. **Capture:** advance/focus the film and capture numbered frames. White is one
+   exposure; RGB is one complete triplet. RAW+JPEG partners remain grouped together.
+   No development runs during capture, and illumination cannot change during an
+   unfinished exposure/download. Reopening a real camera lease requires fresh
+   references before adding captures.
+3. **Develop:** choose a representative frame, adjust rendering exposure, channel
+   gains, measured film-base multipliers, black/white levels and crop, then
+   **Render Preview**. Crop out dark film-holder borders before measuring the base.
+   **Accept this preview** saves an immutable recipe revision; editing any setting
+   requires another preview. These controls do not change camera exposure.
+4. **Export:** process missing/failed frames using the identified accepted revision.
+   A successful export is a validated 16-bit TIFF master and JPEG companion.
+   Pause/cancel retains inputs and diagnostic artifacts. Missing outputs can be
+   regenerated without overwriting existing files.
+
+**Open positives folder** opens the roll's `Positives` directory (`SYNTHETIC-Positives`
+for demo rolls). It contains only positive TIFF/JPEG images and recipe metadata.
+Processing intermediates, effective XMPs and CLI logs stay separately in `Processing`
+and `Previews`. After validated positive publication, the three generated full-size
+processing TIFFs are removed; logs, effective recipes and original captures are kept.
+Preview intermediates and reusable linear decode caches remain available.
+`roll.json`, `captures` and `recipes` retain the acquisition and
+calibration history; **Open / resume** restores the roll.
+Roll manifests currently use absolute paths: keep the roll at its original location
+when resuming it.
+
+Recipes currently apply to the whole roll; per-frame overrides are not implemented.
+Original captures and references are never deleted automatically. A rendered TIFF
+is not reversible RAW and cannot replace retained captures for future reinversion.
+
+### Real image processing
+
+Select **darktable-cli.exe** from a **darktable 5.6.2** installation in Develop.
+The native ARM64 darktable build requires Windows 11.
+This version is pinned because the negadoctor parameter encoding is version-specific.
+Use **RAW or RAW+JPEG** with X-T5 **UNCOMPRESSED or LOSSLESS COMPRESSED** RAF.
+JPEG-only and lossy-compressed RAF inputs are rejected rather than processed as if
+they were linear RAW. The decoder uses CFA black/white correction, demosaicing and
+the camera's standard input matrix, with fixed unity processing white balance and
+no automatic exposure or tone mapping. Camera settings are never changed. It checks
+matching camera/exposure metadata across the selected frame and its references.
+
+Signed scene-linear values from sensor noise/profile matrices are preserved in
+32-bit intermediates; negadoctor applies its density-domain floor, rather than the
+decoder clipping or offsetting RAW data. Generated linear input caches live under
+`Working`; real originals stay in `captures`.
+
+Real exports use ProPhoto RGB TIFF masters and sRGB JPEG companions with embedded
+ICC profiles. Positive/reversal film skips inversion; B&W negatives use monochrome
+inversion.
+
+Allow substantial working space: one 40-megapixel float RGB intermediate is about
+480 MB, and a 16-bit TIFF master about 240 MB before compression. Export is sequential.
+
+Negatives start from measured film-base values and a version-pinned negadoctor
+print recipe, followed by supervised preview/approval. **Import calibrated XMP**
+optionally imports negadoctor print settings; it must use negadoctor v2, the standard
+module order, and no other enabled history modules. Ordinary full RAW-development
+XMPs are not interchangeable with this normalized-linear-input template. Film Light
+owns input normalization, exposure, levels, gains and crop.
+
+Sequential RGB reconstruction divides each selected primary channel by its matching
+no-film reference **before** inversion; it does not HDR-average or independently
+invert the three images. It assumes fixed exposure and registration. Spectral
+crosstalk, physical alignment, film color accuracy and real X-T5 operation still
+require hardware qualification; synthetic validation does not certify them.
 
 ## Build and run
 
@@ -104,6 +188,23 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\SmokeTest.ps1
 With the camera disconnected, `-ProbeCamera` also exercises actual SDK startup and
 the no-camera error path. `-SkipPixels` explicitly disables screen-pixel checks when
 the desktop is unavailable to GDI; UI Automation checks still run.
+
+The four-phase native workflow smoke check uses an explicitly synthetic camera,
+exercises preview invalidation/acceptance, TIFF/JPEG export, missing-output retry
+and reopening, and leaves its demo roll under `artifacts`:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\WorkflowSmokeTest.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\WorkflowSmokeTest.ps1 -CaptureMode Rgb
+```
+
+Processing tests execute actual negadoctor when darktable 5.6.2 is installed at
+`C:\Program Files\darktable\bin\darktable-cli.exe`, or when
+`FILMLIGHT_TEST_DARKTABLE` points to its executable. Otherwise those integration
+cases are explicitly skipped, not reported as real processing.
+Optional public RAW fixture checks use `FILMLIGHT_TEST_RAF`,
+`FILMLIGHT_TEST_SIGNED_RAF` and `FILMLIGHT_TEST_LOSSY_RAF`; those tests also explicitly
+skip when their fixtures are unavailable.
 
 ## Camera-control seam
 

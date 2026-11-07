@@ -70,7 +70,10 @@ function Wait-Text([string]$Prefix, [int]$TimeoutSeconds = 12) {
         }
         Start-Sleep -Milliseconds 50
     } while ([DateTime]::UtcNow -lt $deadline)
-    throw "Timed out waiting for '$Prefix'"
+    $names = @($script:window.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+        [System.Windows.Automation.Condition]::TrueCondition) |
+        ForEach-Object { $_.Current.Name } | Where-Object { $_ } | Select-Object -Unique -First 40)
+    throw "Timed out waiting for '$Prefix'. Visible controls: $($names -join '; ')"
 }
 
 $process = Start-Process -FilePath (Resolve-Path $AppPath) -PassThru

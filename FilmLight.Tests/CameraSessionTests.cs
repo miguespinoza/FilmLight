@@ -194,13 +194,43 @@ public sealed class CameraSessionTests : IDisposable
         Assert.Throws<InvalidDataException>(() => ShotIdentity.Read(image, format));
     }
 
+    [Theory]
+    [InlineData(3, 3)]
+    [InlineData(3, 4)]
+    [InlineData(4, 3)]
+    public void CapturesPartnersWithShortOrLongShotNumbers(ushort rawType, ushort jpegType)
+    {
+        var native = new FakeCamera
+        {
+            Shot = [(1, Image(36543, 1, rawType)), (7, Image(36543, 7, jpegType))]
+        };
+        using var session = Create(native);
+        session.Connect();
+        var result = session.Capture(LightChannel.White, Guid.NewGuid().ToString("N"), CancellationToken.None);
+        Assert.Equal(2, result.FilePaths.Count);
+        Assert.All(result.FilePaths, file => Assert.Equal("White-00036543", Path.GetFileNameWithoutExtension(file)));
+        Assert.False(session.Faulted);
+    }
+
+    [Theory]
+    [InlineData(3, 2)]
+    [InlineData(4, 2)]
+    [InlineData(7, 1)]
+    public void RejectsUnsupportedShotNumberTypesAndCounts(ushort type, uint count)
+    {
+        var image = Image(36543, 7);
+        U16(image, 72, type);
+        U32(image, 74, count);
+        Assert.Throws<InvalidDataException>(() => ShotIdentity.Read(image, 7));
+    }
+
     private CameraSession Create(FakeCamera camera)
     {
         var clock = new FakeTimeProvider();
         return new(camera, output, clock, clock.Advance);
     }
 
-    private static byte[] Image(uint shot, int format)
+    private static byte[] Image(uint shot, int format, ushort shotType = 4)
     {
         var tiff = new byte[74];
         "II"u8.CopyTo(tiff);
@@ -213,7 +243,7 @@ public sealed class CameraSessionTests : IDisposable
         "FUJIFILM"u8.CopyTo(tiff.AsSpan(44));
         U32(tiff, 52, 12);
         U16(tiff, 56, 1);
-        Tag(tiff, 58, 0x1438, 4, 1, shot);
+        Tag(tiff, 58, 0x1438, shotType, 1, shot);
         var jpeg = new byte[88];
         new byte[] { 0xFF, 0xD8, 0xFF, 0xE1 }.CopyTo(jpeg, 0);
         BinaryPrimitives.WriteUInt16BigEndian(jpeg.AsSpan(4, 2), 82);

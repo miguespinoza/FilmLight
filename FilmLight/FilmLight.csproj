@@ -19,5 +19,6 @@
     <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.4948" />
     <ProjectReference Include="..\FilmLight.Core\FilmLight.Core.csproj" />
     <ProjectReference Include="..\FilmLight.Fujifilm\FilmLight.Fujifilm.csproj" />
+    <ProjectReference Include="..\FilmLight.Workflow\FilmLight.Workflow.csproj" />
   </ItemGroup>
 </Project>

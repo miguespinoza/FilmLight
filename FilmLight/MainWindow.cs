@@ -30,6 +30,8 @@ public sealed class MainWindow : Window
     private readonly DisplayRequest displayRequest = new();
     private readonly Button cameraButton = MakeButton("Camera", 110);
     private readonly Button setupButton = MakeButton("Setup", 90);
+    private readonly Button workflowButton = MakeButton("Roll workflow", 190);
+    private RollWorkflowWindow? workflowWindow;
     private readonly TextBlock cameraStatus = new() { Text = "CAMERA \u00b7 not connected \u00b7 tap Camera to detect USB", FontSize = 15, TextTrimming = TextTrimming.CharacterEllipsis, MaxLines = 1 };
     private readonly Border cameraIndicator = new() { Width = 12, Height = 12, CornerRadius = new CornerRadius(6), Background = new SolidColorBrush(Colors.Gray), VerticalAlignment = VerticalAlignment.Center };
     private readonly DispatcherTimer cameraMonitor = new() { Interval = TimeSpan.FromSeconds(2) };
@@ -73,6 +75,7 @@ public sealed class MainWindow : Window
         fullscreen.Height = 44;
         fullscreen.Click += async (_, _) =>
         {
+            if (workflowWindow is not null) return;
             if (running)
             {
                 Pause("Paused for fullscreen change.");
@@ -110,6 +113,8 @@ public sealed class MainWindow : Window
         cameraButton.Click += async (_, _) => await ShowCameraAsync();
         setupButton.Click += async (_, _) => await ShowSetupAsync();
         controls.Children.Add(setupButton);
+        controls.Children.Add(workflowButton);
+        workflowButton.Click += (_, _) => OpenRollWorkflow();
         toolbar.Children.Add(new ScrollViewer
         {
             Content = controls,
@@ -125,6 +130,7 @@ public sealed class MainWindow : Window
         escape.Invoked += async (_, args) =>
         {
             args.Handled = true;
+            if (workflowWindow is not null) return;
             Pause("Paused. Restart begins a fresh RGB set.");
             if (camera is not null && activeCapture is not null) await activeCapture;
             AppWindow.SetPresenter(AppWindowPresenterKind.Default);
@@ -159,6 +165,7 @@ public sealed class MainWindow : Window
         };
         Activated += (_, args) =>
         {
+            if (workflowWindow is not null) return;
             if (args.WindowActivationState == WindowActivationState.Deactivated)
             {
                 windowActive = false;
@@ -182,6 +189,11 @@ public sealed class MainWindow : Window
         {
             if (closingReady) return;
             args.Cancel = true;
+            if (workflowWindow is not null)
+            {
+                ShowError("Close the roll workflow before closing Film Light. The workflow owns the camera.");
+                return;
+            }
             if (connecting || camera?.Faulted == true)
             {
                 ShowError(connecting ? "Wait for camera connection to finish before closing."
@@ -231,6 +243,7 @@ public sealed class MainWindow : Window
 
     private void SetMode(bool useRgb)
     {
+        if (workflowWindow is not null) return;
         rgbMode = useRgb;
         status.Text = useRgb
             ? camera is null ? "Timer mode \u00b7 camera not connected" : $"{camera.Connection?.Model} \u00b7 USB capture + download"
@@ -250,7 +263,9 @@ public sealed class MainWindow : Window
 
     private void Refresh()
     {
+        if (workflowWindow is not null) return;
         var locked = running || connecting || camera?.Faulted == true || cameraActivity.Stage == CameraStage.Busy;
+        workflowButton.IsEnabled = !locked && !checkingCamera && activeCapture is null && !closeRequested;
         white.IsEnabled = rgb.IsEnabled = reset.IsEnabled = !locked;
         repeat.IsEnabled = !locked;
         cameraButton.IsEnabled = !running && !connecting;
@@ -289,6 +304,7 @@ public sealed class MainWindow : Window
 
     private async Task StartAsync()
     {
+        if (workflowWindow is not null) return;
         if (captureCancellation is not null || connecting || camera?.Faulted == true || (!rgbMode && camera is null)) return;
         using var cancellation = new CancellationTokenSource();
         captureCancellation = cancellation;
@@ -360,6 +376,7 @@ public sealed class MainWindow : Window
     {
         if (closed) return;
         cameraActivity = activity;
+        workflowWindow?.UpdateCameraActivity(activity);
         cameraStatus.Text = $"CAMERA \u00b7 {(activity.Channel.HasValue ? $"{activity.Channel} \u00b7 " : "")}{activity.Message}";
         cameraIndicator.Background = new SolidColorBrush(activity.Stage switch
         {
@@ -372,7 +389,7 @@ public sealed class MainWindow : Window
 
     private async Task CheckCameraAsync()
     {
-        if (closed || closeRequested || checkingCamera || connecting || running || camera is null || camera.Faulted) return;
+        if (workflowWindow is not null || closed || closeRequested || checkingCamera || connecting || running || camera is null || camera.Faulted) return;
         checkingCamera = true;
         try { await camera.CheckConnectionAsync(); }
         catch (CameraSdkException ex)
@@ -389,6 +406,7 @@ public sealed class MainWindow : Window
 
     private async Task ShowCameraAsync()
     {
+        if (workflowWindow is not null) return;
         if (running || connecting) return;
         if (camera is not null)
         {
@@ -558,6 +576,7 @@ public sealed class MainWindow : Window
 
     private async Task ShowSetupAsync()
     {
+        if (workflowWindow is not null) return;
         Pause("Paused for setup. Restart begins a fresh RGB set.");
         var dialog = new ContentDialog
         {
@@ -577,5 +596,34 @@ public sealed class MainWindow : Window
             if (!await Launcher.LaunchUriAsync(new Uri("ms-settings:display")))
                 ShowError("Windows could not open Display settings.");
         }
+    }
+
+    private void OpenRollWorkflow()
+    {
+        if (workflowWindow is not null || running || activeCapture is not null || connecting || checkingCamera
+            || closeRequested || camera?.Faulted == true || cameraActivity.Stage == CameraStage.Busy) return;
+        cameraMonitor.Stop();
+        var child = new RollWorkflowWindow(camera?.Connection is not null ? camera : null, released =>
+        {
+            if (ReferenceEquals(camera, released))
+            {
+                camera = null;
+                UpdateCameraActivity(new(CameraStage.Disconnected, "Camera released by roll workflow; reconnect using Camera."));
+            }
+        });
+        workflowWindow = child;
+        root.IsHitTestVisible = false;
+        child.Closed += (_, _) =>
+        {
+            workflowWindow = null;
+            root.IsHitTestVisible = true;
+            cameraMonitor.Start();
+            Refresh();
+            AppWindow.Show();
+            Activate();
+        };
+        ReleaseWake();
+        AppWindow.Hide();
+        child.Activate();
     }
 }

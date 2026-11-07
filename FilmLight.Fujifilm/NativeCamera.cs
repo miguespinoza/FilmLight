@@ -88,11 +88,10 @@ public sealed class NativeCamera : INativeCamera
     {
         if (GetValue("XSDK_GetPriorityMode") != 1)
             throw new CameraSdkException("Camera priority changed. Reconnect; Film Light will not trigger using PC exposure settings.");
+        // The X-T5 reports movie through drive mode (XT5_DRIVE_MODE_MOVIE); XSDK_GetMode fails on it
+        // with UNSUPPORTED/UNKNOWN (both FATAL), so drive mode S is the still single-shot check.
         if (GetValue("XSDK_GetDriveMode") != 4)
-            throw new CameraSdkException("Set the camera drive dial to S (single shot).");
-        var mode = GetValue("XSDK_GetMode");
-        if (mode is < 1 or > 8)
-            throw new CameraSdkException("Set the camera to standard still-photo mode, not movie or a special drive mode.");
+            throw new CameraSdkException("Set the camera to still mode with the drive dial on S (single shot).");
         if (GetProperty(0x2202) != 1)
             throw new CameraSdkException("Set the focus selector to M. Manual focus avoids focus changes between RGB exposures.");
         if (GetProperty(0x2130) != quality)
