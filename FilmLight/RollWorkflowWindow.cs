@@ -9,6 +9,7 @@ using Microsoft.UI.Xaml.Controls.Primitives;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Media.Imaging;
+using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text.Json;
 using Windows.System.Display;
@@ -21,10 +22,25 @@ public sealed class RollWorkflowWindow : Window
     private readonly Border light = new() { IsHitTestVisible = false, Background = new SolidColorBrush(Colors.White) };
     private readonly Grid workspace = new() { Background = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 24, 26, 30)), Padding = new Thickness(18), RowSpacing = 12 };
     private readonly Image preview = new() { Stretch = Stretch.Uniform };
+    private readonly Border activityOverlay = new()
+    {
+        Visibility = Visibility.Collapsed, IsHitTestVisible = false,
+        Background = new SolidColorBrush(Windows.UI.Color.FromArgb(235, 24, 26, 30))
+    };
+    private readonly ProgressRing activityRing = new() { Width = 48, Height = 48 };
+    private readonly TextBlock activityStage = Text("", 24);
+    private readonly TextBlock activityDetail = Text("");
+    private readonly TextBlock activityElapsed = Text("", 16);
+    private readonly TextBlock activityContext = Text("", 16);
+    private readonly Stopwatch operationClock = new();
+    private readonly Stopwatch stageClock = new();
+    private readonly DispatcherTimer activityTimer = new() { Interval = TimeSpan.FromSeconds(1) };
     private readonly TextBlock previewLabel = Text("Capture a frame to see its positive preview.", 20);
     private readonly TextBlock samplingLabel = Text("Pick exposed backlight for WB, or clear/unexposed film for the base. Samples use linear inputs, not JPEG colors.", 14);
     private readonly Button pickBacklight = Button("Pick backlight WB");
     private readonly Button pickFilmBase = Button("Pick film base");
+    private readonly Button autoPicks = Button("Auto-pick light + base");
+    private readonly Button resetPicks = Button("Reset picks");
     private readonly ToggleButton sourceView = new() { Content = "Show negative", MinHeight = 48, FontSize = 17 };
     private readonly Button developSettings = Button("Develop settings");
     private readonly Flyout settingsFlyout = new();
@@ -32,7 +48,7 @@ public sealed class RollWorkflowWindow : Window
     private readonly StackPanel capturePanel = new() { Spacing = 8 };
     private readonly StackPanel exportPanel = new() { Spacing = 10 };
     private readonly TextBlock identity = Text("", 21);
-    private readonly TextBlock message = Text("Create or open a roll. Capture references before frames.");
+    private readonly TextBlock message = Text("Create or open a roll, capture a picture, then pick the exposed light and clear film.");
     private readonly TextBlock warnings = Text("");
     private readonly TextBlock recipeLabel = Text("");
     private readonly TextBlock exportLabel = Text("");
@@ -49,8 +65,6 @@ public sealed class RollWorkflowWindow : Window
     private readonly Button create = Button("New roll");
     private readonly Button open = Button("Open / resume");
     private readonly Button demo = Button("Demo camera");
-    private readonly Button lightReference = Button("Capture NO-FILM reference");
-    private readonly Button filmBase = Button("Capture FILM BASE reference");
     private readonly Button nextFrame = Button("Capture frame 1");
     private readonly Button render = Button("Render Preview");
     private readonly Button accept = Button("Accept this preview");
@@ -58,16 +72,17 @@ public sealed class RollWorkflowWindow : Window
     private readonly Button retry = Button("Retry selected frame");
     private readonly Button showOutputs = Button("Open positives folder");
     private readonly Button cancel = Button("Pause / cancel safely");
+    private readonly Button connect = Button("Connect USB camera");
     private readonly Button release = Button("Confirm idle / release camera");
     private readonly Button close = Button("Close workflow");
     private readonly List<Control> lockedControls = [];
     private readonly Dictionary<WorkflowPhase, Button> phaseButtons = [];
     private readonly Dictionary<string, TextBlock> recipeValues = [];
-    private readonly HashSet<Guid> sessionReferences = [];
     private readonly DisplayRequest wake = new();
     private readonly RollLibrary library = new(Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "FilmLight", "Rolls"));
     private readonly Action<CameraClient> cameraReleased;
+    private readonly Func<Window, XamlRoot, Task<CameraClient?>> connectCamera;
     private CameraClient? camera;
     private IWorkflowCaptureSource? source;
     private RollStore? store;
@@ -84,7 +99,9 @@ public sealed class RollWorkflowWindow : Window
     private CancellationTokenSource? cancellation;
     private Task? operation;
     private bool busy;
+    private bool previewInProgress;
     private bool capturing;
+    private bool connectingCamera;
     private bool faultHeld;
     private bool demoSticky;
     private bool refreshing;
@@ -92,13 +109,15 @@ public sealed class RollWorkflowWindow : Window
     private bool closeReady;
     private bool wakeActive;
     private bool isActive = true;
-    private WorkflowPhase phase;
+    private WorkflowPhase phase = WorkflowPhase.Capture;
     private string lastWarning = "";
 
-    public RollWorkflowWindow(CameraClient? connectedCamera, Action<CameraClient> onCameraReleased)
+    public RollWorkflowWindow(CameraClient? connectedCamera, Action<CameraClient> onCameraReleased,
+        Func<Window, XamlRoot, Task<CameraClient?>> onConnectCamera)
     {
         camera = connectedCamera;
         cameraReleased = onCameraReleased;
+        connectCamera = onConnectCamera;
         if (camera is not null) source = new RealCameraCaptureSource(camera);
         Title = "Film Light - Roll workflow";
         AppWindow.Resize(new Windows.Graphics.SizeInt32(1400, 950));
@@ -114,10 +133,34 @@ public sealed class RollWorkflowWindow : Window
         previewHeader.Children.Add(previewLabel);
         previewHeader.Children.Add(frames);
         workspace.Children.Add(previewHeader);
-        Grid.SetRow(preview, 1);
-        workspace.Children.Add(preview);
+        var previewArea = new Grid();
+        previewArea.Children.Add(preview);
+        var activityPanel = new StackPanel
+        {
+            Spacing = 12, MaxWidth = 520, Margin = new Thickness(24),
+            VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Center
+        };
+        activityPanel.Children.Add(activityRing);
+        foreach (var label in new[] { activityStage, activityDetail, activityElapsed, activityContext })
+        {
+            label.TextAlignment = TextAlignment.Center;
+            activityPanel.Children.Add(label);
+        }
+        activityOverlay.Child = activityPanel;
+        previewArea.Children.Add(activityOverlay);
+        Grid.SetRow(previewArea, 1);
+        workspace.Children.Add(previewArea);
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(activityRing, "Workflow activity indicator");
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(activityRing, "WorkflowActivityIndicator");
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetAccessibilityView(activityRing,
+            Microsoft.UI.Xaml.Automation.Peers.AccessibilityView.Content);
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(activityStage, "WorkflowActivityStage");
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(activityElapsed, "WorkflowActivityElapsed");
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetLiveSetting(activityStage,
+            Microsoft.UI.Xaml.Automation.Peers.AutomationLiveSetting.Polite);
+        activityTimer.Tick += (_, _) => UpdateElapsed();
         var sampling = new StackPanel { Spacing = 8 };
-        sampling.Children.Add(HorizontalScroll(Row(sourceView, pickBacklight, pickFilmBase)));
+        sampling.Children.Add(HorizontalScroll(Row(sourceView, autoPicks, pickBacklight, pickFilmBase, resetPicks)));
         sampling.Children.Add(samplingLabel);
         Grid.SetRow(sampling, 2);
         workspace.Children.Add(sampling);
@@ -139,15 +182,16 @@ public sealed class RollWorkflowWindow : Window
         setupRow = Row(create, open, demo, filmKind, mode);
         toolbar.Children.Add(HorizontalScroll(setupRow));
         var navigation = Row();
-        foreach (var item in Enum.GetValues<WorkflowPhase>())
+        foreach (var item in Enum.GetValues<WorkflowPhase>().Where(p => p != WorkflowPhase.References))
         {
             var target = item;
-            var button = Button($"{(int)item + 1}. {item}");
+            var button = Button($"{(int)item}. {item}");
             button.Click += (_, _) => StartOperation(_ => NavigateAsync(target));
             navigation.Children.Add(button);
             phaseButtons.Add(item, button);
         }
         navigation.Children.Add(cancel);
+        navigation.Children.Add(connect);
         navigation.Children.Add(release);
         navigation.Children.Add(close);
         toolbar.Children.Add(HorizontalScroll(navigation));
@@ -160,7 +204,7 @@ public sealed class RollWorkflowWindow : Window
             VerticalScrollBarVisibility = ScrollBarVisibility.Auto
         };
         developSettings.Flyout = settingsFlyout;
-        capturePanel.Children.Add(HorizontalScroll(Row(lightReference, filmBase, nextFrame, developSettings, render, accept)));
+        capturePanel.Children.Add(HorizontalScroll(Row(nextFrame, developSettings, render, accept)));
         toolbar.Children.Add(capturePanel);
         toolbar.Children.Add(exportPanel);
         warnings.Foreground = new SolidColorBrush(Colors.Orange);
@@ -199,11 +243,9 @@ public sealed class RollWorkflowWindow : Window
             UseDemo();
             Refresh();
         };
-        lightReference.Click += (_, _) => StartOperation(token => CaptureAsync(CapturePurpose.LightReference, token));
-        filmBase.Click += (_, _) => StartOperation(token => CaptureAsync(CapturePurpose.FilmBaseReference, token));
-        nextFrame.Click += (_, _) => StartOperation(token => CaptureAsync(CapturePurpose.Frame, token));
+        nextFrame.Click += (_, _) => StartOperation(CaptureAsync);
         render.Click += (_, _) => { settingsFlyout.Hide(); StartOperation(RenderAsync); };
-        accept.Click += (_, _) => StartOperation(AcceptAsync);
+        accept.Click += (_, _) => StartOperation(token => AcceptAsync(token));
         batch.Click += (_, _) => StartOperation(token => ExportAsync(false, token));
         retry.Click += (_, _) => StartOperation(token => ExportAsync(true, token));
         showOutputs.Click += (_, _) => StartOperation(async _ =>
@@ -216,9 +258,15 @@ public sealed class RollWorkflowWindow : Window
         cancel.Click += (_, _) =>
         {
             cancellation?.Cancel();
-            message.Text = "Pausing: current camera exposure/download must finish. Illumination stays held.";
+            SetActivity("Pausing safely", capturing
+                ? "Waiting for the current exposure and download to finish. Illumination stays held."
+                : "Stopping processing. Completed captures and diagnostic files remain saved.");
+            message.Text = capturing
+                ? "Pausing: current camera exposure/download must finish. Illumination stays held."
+                : "Pausing: stopping processing. Saved captures remain available.";
         };
         release.Click += (_, _) => StartOperation(ReleaseCameraAsync, allowFault: true);
+        connect.Click += (_, _) => StartOperation(ConnectCameraAsync);
         close.Click += async (_, _) => await RequestCloseAsync();
         frames.SelectionChanged += (_, _) =>
         {
@@ -232,10 +280,16 @@ public sealed class RollWorkflowWindow : Window
         sourceView.Unchecked += (_, _) => UpdatePreviewImage();
         pickBacklight.Click += (_, _) => BeginSampling(CalibrationTarget.Backlight);
         pickFilmBase.Click += (_, _) => BeginSampling(CalibrationTarget.FilmBase);
+        autoPicks.Click += (_, _) => StartOperation(AutoPickAsync);
+        resetPicks.Click += (_, _) => StartOperation(async token =>
+        {
+            await SaveDraftAsync(draft with { PictureCalibration = new() }, token);
+            await RenderAsync(token);
+        });
         preview.PointerPressed += PickPreviewPoint;
         mode.SelectionChanged += (_, _) => { if (!refreshing) Refresh(); };
-        lockedControls.AddRange([create, open, demo, filmKind, mode, frames, lightReference, filmBase,
-            nextFrame, render, accept, batch, retry, showOutputs, pickBacklight, pickFilmBase, developSettings, sourceView]);
+        lockedControls.AddRange([create, open, demo, filmKind, mode, frames, nextFrame, render, accept,
+            batch, retry, showOutputs, autoPicks, pickBacklight, pickFilmBase, resetPicks, developSettings, sourceView]);
         lockedControls.AddRange(phaseButtons.Values);
         Activated += (_, args) =>
         {
@@ -243,6 +297,7 @@ public sealed class RollWorkflowWindow : Window
             if (!isActive && capturing)
             {
                 cancellation?.Cancel();
+                SetActivity("Pausing safely", "Focus lost. Waiting for the current exposure/download; light stays held.");
                 message.Text = "Focus lost: pausing after the current exposure/download. Light held.";
             }
             if (isActive) AcquireWake();
@@ -254,7 +309,11 @@ public sealed class RollWorkflowWindow : Window
             args.Cancel = true;
             await RequestCloseAsync();
         };
-        Closed += (_, _) => ReleaseWake();
+        Closed += (_, _) =>
+        {
+            activityTimer.Stop();
+            ReleaseWake();
+        };
         Refresh();
         AppWindow.SetPresenter(AppWindowPresenterKind.FullScreen);
         AcquireWake();
@@ -273,8 +332,11 @@ public sealed class RollWorkflowWindow : Window
 
     public void UpdateCameraActivity(CameraActivity activity)
     {
-        if (capturing && !closing)
+        if ((capturing || connectingCamera) && !closing && cancellation?.IsCancellationRequested != true)
+        {
+            SetActivity("Camera", $"{(activity.Channel.HasValue ? $"{activity.Channel}: " : "")}{activity.Message}");
             message.Text = $"CAMERA - {(activity.Channel.HasValue ? $"{activity.Channel}: " : "")}{activity.Message}";
+        }
     }
 
     private async Task RequestCloseAsync()
@@ -282,6 +344,7 @@ public sealed class RollWorkflowWindow : Window
         if (closing || closeReady) return;
         closing = true;
         cancellation?.Cancel();
+        SetActivity("Closing safely", "Waiting for the current transaction to finish. Light and camera ownership remain held.");
         message.Text = "Closing after the current transaction finishes. Light and camera ownership remain held.";
         Refresh();
         if (operation is not null) await operation;
@@ -327,6 +390,14 @@ public sealed class RollWorkflowWindow : Window
         if (busy || closing || (faultHeld && !allowFault)) return;
         busy = true;
         cancellation = new();
+        operationClock.Restart();
+        stageClock.Restart();
+        activityContext.Text = "Please wait. Use Pause / cancel safely to stop the operation.";
+        SetActivity("Working", "Waiting for the requested operation.");
+        activityOverlay.Visibility = Visibility.Visible;
+        activityRing.IsActive = true;
+        activityTimer.Start();
+        UpdateElapsed();
         Refresh();
         operation = RunOperationAsync(action, cancellation);
     }
@@ -336,10 +407,12 @@ public sealed class RollWorkflowWindow : Window
         try { await action(tokenSource.Token); }
         catch (OperationCanceledException) when (tokenSource.IsCancellationRequested)
         {
+            if (previewInProgress) previewLabel.Text = "Positive preview paused - saved capture retained.";
             message.Text = "Paused. Completed captures remain saved; incomplete inputs are retained. Use Render Preview to retry a canceled preview.";
         }
         catch (Exception ex) when (IsOperationalError(ex))
         {
+            if (previewInProgress) previewLabel.Text = "Positive preview failed - see the error below.";
             message.Text = $"Operation failed: {ex.Message}";
         }
         finally
@@ -348,6 +421,14 @@ public sealed class RollWorkflowWindow : Window
             tokenSource.Dispose();
             cancellation = null;
             busy = false;
+            previewInProgress = false;
+            activityTimer.Stop();
+            operationClock.Stop();
+            stageClock.Stop();
+            activityRing.IsActive = false;
+            activityOverlay.Visibility = Visibility.Collapsed;
+            if (operationClock.Elapsed.TotalSeconds >= 1)
+                message.Text += $" Elapsed {Elapsed(operationClock)}.";
             if (!isActive && !faultHeld) ReleaseWake();
             Refresh();
         }
@@ -358,15 +439,28 @@ public sealed class RollWorkflowWindow : Window
         or System.Runtime.InteropServices.ExternalException or System.ComponentModel.Win32Exception or TimeoutException
         or NotSupportedException;
 
+    private void SetActivity(string stage, string detail)
+    {
+        if (activityStage.Text != stage) stageClock.Restart();
+        activityStage.Text = stage;
+        activityDetail.Text = detail;
+        UpdateElapsed();
+    }
+
+    private static string Elapsed(Stopwatch clock) => $"{(int)clock.Elapsed.TotalMinutes:00}:{clock.Elapsed.Seconds:00}";
+
+    private void UpdateElapsed() =>
+        activityElapsed.Text = $"Elapsed {Elapsed(operationClock)} | Current stage {Elapsed(stageClock)}";
+
     private async Task CreateAsync(CancellationToken token)
     {
-        if (source is null) throw new InvalidOperationException("Connect a real camera in the parent window or explicitly select Demo camera.");
+        if (source is null) throw new InvalidOperationException("Use Connect USB camera here or explicitly select Demo camera.");
         token.ThrowIfCancellationRequested();
         var kind = (FilmKind)filmKind.SelectedItem;
         var simulated = source.IsDemo;
         var created = await Task.Run(() => library.Create(kind, simulated), token);
         LoadRoll(created, Mode);
-        message.Text = $"Created {created.RootPath}. Remove film and capture the light reference.";
+        message.Text = $"Created {created.RootPath}. Capture a picture with {RequiredPicks} visible, then pick with the mouse.";
     }
 
     private async Task OpenAsync(CancellationToken token)
@@ -395,10 +489,10 @@ public sealed class RollWorkflowWindow : Window
     private void LoadRoll(RollStore loaded, CaptureMode? requestedMode = null)
     {
         store = loaded;
-        sessionReferences.Clear();
-        phase = loaded.Document.Phase;
+        phase = loaded.Document.Phase == WorkflowPhase.References ? WorkflowPhase.Capture : loaded.Document.Phase;
+        if (phase != loaded.Document.Phase) loaded.SetPhase(phase);
         draft = loaded.Document.Recipes.LastOrDefault() ?? new DevelopRecipe { FilmKind = loaded.Document.FilmKind };
-        draft = draft with { Accepted = false, AcceptedAt = null };
+        draft = draft with { PictureCalibration = draft.PictureCalibration ?? new(), Accepted = false, AcceptedAt = null };
         refreshing = true;
         filmKind.SelectedItem = loaded.Document.FilmKind;
         mode.SelectedItem = loaded.Document.Captures.FirstOrDefault()?.Mode ?? requestedMode ?? CaptureMode.White;
@@ -412,38 +506,18 @@ public sealed class RollWorkflowWindow : Window
     private RollCapture? SelectedFrame => (frames.SelectedItem as FrameChoice)?.Capture;
     private sealed record FrameChoice(RollCapture Capture)
     {
-        public override string ToString() => $"Frame {Capture.Number} - {Capture.Mode}{(Capture.IsDemo ? " - SYNTHETIC" : "")}";
+        public override string ToString() => $"Frame {Capture.Number} - {Capture.Mode} - " +
+            $"{string.Join("+", Capture.Files.Select(f => Path.GetExtension(f.Path).TrimStart('.').ToUpperInvariant()).Distinct())}" +
+            $"{(Capture.IsDemo ? " - SYNTHETIC" : "")}";
     }
 
-    private bool HasLightReference() => store?.Document.Captures.Any(c =>
-        c.Purpose == CapturePurpose.LightReference && c.Mode == Mode && c.IsDemo == store.Document.IsDemo && Complete(c)) == true;
-
-    private static bool Complete(RollCapture capture)
-    {
-        LightChannel[] required = capture.Mode == CaptureMode.White
-            ? [LightChannel.White] : [LightChannel.Red, LightChannel.Green, LightChannel.Blue];
-        return required.All(channel => capture.Files.Any(f => f.Channel == channel))
-            && capture.Files.All(f => required.Contains(f.Channel) && File.Exists(f.Path) && new FileInfo(f.Path).Length > 0);
-    }
-
-    private bool HasFilmBase() => store?.Document.FilmKind == FilmKind.Positive || store?.Document.Captures.Any(c =>
-        c.Purpose == CapturePurpose.FilmBaseReference && c.Mode == Mode && c.IsDemo == store.Document.IsDemo && Complete(c)) == true;
-
-    private bool HasSessionReference(CapturePurpose purpose) => store?.Document.Captures.Any(c =>
-        c.Purpose == purpose && c.Mode == Mode && c.IsDemo == store.Document.IsDemo && Complete(c)
-        && (store.Document.IsDemo || sessionReferences.Contains(c.Id))) == true;
-
-    private bool CaptureReferencesReady() => HasSessionReference(CapturePurpose.LightReference)
-        && (store?.Document.FilmKind == FilmKind.Positive || HasSessionReference(CapturePurpose.FilmBaseReference));
+    private bool PicksReady => draft.PictureCalibration?.IsComplete(draft.FilmKind) == true;
+    private string RequiredPicks => draft.FilmKind == FilmKind.Positive ? "exposed light" : "exposed light and clear film";
 
     private Task NavigateAsync(WorkflowPhase target)
     {
         settingsFlyout.Hide();
         if (store is null) throw new InvalidOperationException("Create or open a roll first.");
-        if (target == WorkflowPhase.Capture && !HasSessionReference(CapturePurpose.LightReference))
-            throw new InvalidOperationException("Capture a complete matching no-film light reference before capturing the roll.");
-        if (target == WorkflowPhase.Capture && !CaptureReferencesReady())
-            throw new InvalidOperationException("Capture clear/unexposed film-base references before negative frames, so the processor can match every frame to earlier references.");
         if (target == WorkflowPhase.Develop && !store.Document.Captures.Any(c => c.Purpose == CapturePurpose.Frame))
             throw new InvalidOperationException("Capture a frame before Develop. There are no frames yet.");
         if (target == WorkflowPhase.Export && AcceptedRecipe() is null)
@@ -452,7 +526,6 @@ public sealed class RollWorkflowWindow : Window
         phase = target;
         message.Text = target switch
         {
-            WorkflowPhase.References => "Remove film for the light reference; insert clear/unexposed film for the film-base reference.",
             WorkflowPhase.Capture => "Capture frames: each saved frame is automatically rendered as a positive. Light stays fixed while previewing.",
             WorkflowPhase.Develop => "Choose a representative frame. Adjust processing only, render a preview, then accept the exact recipe.",
             _ => "Batch uses only the accepted revision identified below, never unaccepted edits. Existing successful outputs are retained."
@@ -460,57 +533,50 @@ public sealed class RollWorkflowWindow : Window
         return Task.CompletedTask;
     }
 
-    private async Task CaptureAsync(CapturePurpose purpose, CancellationToken token)
+    private async Task CaptureAsync(CancellationToken token)
     {
         settingsFlyout.Hide();
         if (store is null || source is null) throw new InvalidOperationException("Create/open a roll and select an available capture source.");
         if (source.IsDemo != store.Document.IsDemo) throw new InvalidOperationException("Capture source does not match this roll's immutable demo/real identity.");
         if (store.Document.Captures.Any(c => c.Mode != Mode))
-            throw new InvalidOperationException("Capture mode is fixed after the first reference. Create a separate roll for another mode.");
-        if (purpose != CapturePurpose.LightReference && !HasSessionReference(CapturePurpose.LightReference))
-            throw new InvalidOperationException("Capture a matching complete no-film reference in this camera lease first. Reopened real rolls require fresh references before additional captures.");
-        if (purpose == CapturePurpose.Frame && !CaptureReferencesReady())
-            throw new InvalidOperationException("Capture matching film-base references in this camera lease before negative frames.");
-        if (purpose == CapturePurpose.Frame && phase != WorkflowPhase.Capture)
+            throw new InvalidOperationException("Capture mode is fixed after the first picture. Create a separate roll for another mode.");
+        if (phase != WorkflowPhase.Capture)
             throw new InvalidOperationException("Use the Capture phase for frames.");
-        if (purpose != CapturePurpose.Frame && phase != WorkflowPhase.References)
-            throw new InvalidOperationException("Use References for calibration captures.");
         var number = store.Document.Captures.Where(c => c.Purpose == CapturePurpose.Frame).Select(c => c.Number).DefaultIfEmpty(0).Max() + 1;
-        message.Text = $"{purpose} {number}: exposing / downloading. Light and camera ownership are locked.";
+        activityContext.Text = $"Capturing frame {number}. Illumination stays fixed until all exposures and downloads finish.";
+        SetActivity($"Capturing frame {number}", "Setting the light, then exposing and downloading the complete capture.");
+        message.Text = $"Frame {number}: exposing / downloading. Light and camera ownership are locked.";
         var directory = Path.Combine(store.RootPath, "Acquisition", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(directory);
         capturing = true;
         Refresh();
         try
         {
-            var files = await source.CaptureAsync(purpose, Mode, number, directory, ShowLightAsync, token);
+            var files = await source.CaptureAsync(CapturePurpose.Frame, Mode, number, directory, ShowLightAsync, token);
             token.ThrowIfCancellationRequested();
             var activeStore = store;
             var captureMode = Mode;
             var simulated = source.IsDemo;
             message.Text = "Saving the complete capture set into the roll. Inputs remain retained.";
-            var captured = await Task.Run(() => activeStore.AddCapture(purpose, captureMode, files, simulated));
-            if (purpose != CapturePurpose.Frame) sessionReferences.Add(captured.Id);
-            message.Text = $"{purpose} {captured.Number} saved ({files.Count} files). " +
-                (purpose == CapturePurpose.Frame ? "Advance film, then capture the next frame." : "Reference saved; camera/display settings must remain unchanged.");
-            if (purpose == CapturePurpose.Frame)
+            SetActivity("Saving capture", $"Saving frame {number} into the roll before starting its positive preview.");
+            var captured = await Task.Run(() => activeStore.AddCapture(CapturePurpose.Frame, captureMode, files, simulated));
+            capturing = false;
+            ClearDisplayedPreview();
+            InvalidatePreview();
+            Refresh();
+            refreshing = true;
+            frames.SelectedItem = frames.Items.OfType<FrameChoice>().Single(c => c.Capture.Id == captured.Id);
+            refreshing = false;
+            try
             {
-                capturing = false;
-                ClearDisplayedPreview();
-                InvalidatePreview();
-                Refresh();
-                refreshing = true;
-                frames.SelectedItem = frames.Items.OfType<FrameChoice>().Single(c => c.Capture.Id == captured.Id);
-                refreshing = false;
-                try
-                {
-                    await RenderAsync(token);
-                    message.Text = $"Frame {captured.Number} saved. Positive preview ready; sample WB / film base or advance and capture the next frame.";
-                }
-                catch (Exception ex) when (IsOperationalError(ex))
-                {
-                    throw new InvalidOperationException($"Frame {captured.Number} was saved, but its positive preview failed: {ex.Message} Use Render Preview to retry; do not recapture.", ex);
-                }
+                await RenderAsync(token);
+                message.Text = $"Frame {captured.Number} saved. " + (PicksReady
+                    ? "Positive preview uses the roll's saved light and film picks. Advance and capture the next frame."
+                    : $"Provisional positive preview ready. Pick {RequiredPicks} in this picture; the picks apply to the whole roll.");
+            }
+            catch (Exception ex) when (IsOperationalError(ex))
+            {
+                throw new InvalidOperationException($"Frame {captured.Number} was saved, but its positive preview failed: {ex.Message} Use Render Preview to retry; do not recapture.", ex);
             }
         }
         finally { capturing = false; }
@@ -652,20 +718,32 @@ public sealed class RollWorkflowWindow : Window
         public void Report(ProcessingProgress value) => report(value);
     }
 
-    private IProgress<ProcessingProgress> Progress() => new CallbackProgress(p =>
+    private IProgress<ProcessingProgress> Progress()
     {
-        void Update()
+        var owner = cancellation;
+        return new CallbackProgress(p =>
         {
-            if (busy) message.Text = $"{p.Stage}: {p.Message} ({p.Completed}/{p.Total})";
-        }
-        if (DispatcherQueue.HasThreadAccess) Update();
-        else if (!DispatcherQueue.TryEnqueue(Update))
-            throw new InvalidOperationException("The workflow progress window is unavailable.");
-    });
+            void Update()
+            {
+                if (!busy || closing || cancellation != owner || owner?.IsCancellationRequested == true) return;
+                var frame = store?.Document.Captures.FirstOrDefault(c => c.Id == p.FrameId);
+                var detail = $"{(frame is null ? "" : $"Frame {frame.Number}: ")}{p.Message}";
+                SetActivity(p.Stage, detail);
+                message.Text = $"{p.Stage}: {detail}" + (p.Total > 0 ? $" ({p.Completed}/{p.Total})" : "");
+            }
+            if (DispatcherQueue.HasThreadAccess) Update();
+            else if (!DispatcherQueue.TryEnqueue(Update))
+                throw new InvalidOperationException("The workflow progress window is unavailable.");
+        });
+    }
 
     private async Task RenderAsync(CancellationToken token)
     {
         if (store is null || SelectedFrame is not { } frame) throw new InvalidOperationException("Select a representative captured frame.");
+        previewInProgress = true;
+        previewLabel.Text = $"Frame {frame.Number} - generating positive preview...";
+        activityContext.Text = $"Frame {frame.Number} is saved. RAW conversion can take a while, especially the first time. No need to recapture.";
+        SetActivity("Starting positive preview", "Preparing the current recipe and saved input.");
         InvalidatePreview();
         ValidateRecipe();
         var exact = draft;
@@ -678,6 +756,7 @@ public sealed class RollWorkflowWindow : Window
         if (!File.Exists(result.ImagePath) || new FileInfo(result.ImagePath).Length == 0
             || !new[] { ".jpg", ".jpeg", ".png" }.Contains(Path.GetExtension(result.ImagePath).ToLowerInvariant()))
             throw new InvalidDataException("Processor did not return an existing JPG/PNG preview.");
+        SetActivity("Loading preview", "Conversion finished. Loading the positive and source images into the window.");
         var bitmap = await LoadBitmapAsync(result.ImagePath);
         var negative = result.SourceImagePath is null ? null : await LoadBitmapAsync(result.SourceImagePath);
         token.ThrowIfCancellationRequested();
@@ -691,8 +770,11 @@ public sealed class RollWorkflowWindow : Window
         previewedRecipe = exact;
         previewedFrame = frame.Id;
         previewedXmpHash = xmpHash;
+        previewInProgress = false;
         lastWarning = string.Join("\n", result.Warnings);
-        message.Text = "Preview rendered for the exact current recipe. Inspect it, then accept; any edit requires another preview.";
+        message.Text = "Preview rendered for the exact current recipe. " + (PicksReady
+            ? "Inspect it, then accept; any manual edit requires another preview."
+            : $"Pick {RequiredPicks} in this picture; the picks apply to the whole roll.");
     }
 
     private static async Task<BitmapImage> LoadBitmapAsync(string path)
@@ -726,8 +808,28 @@ public sealed class RollWorkflowWindow : Window
         samplingTarget = target;
         sourceView.IsChecked = true;
         samplingLabel.Text = target == CalibrationTarget.Backlight
-            ? "Click an exposed backlight patch (no film). A 5 x 5 linear-input patch sets processing WB gains."
-            : "Click clear/unexposed developed film, not the image or holder. A 5 x 5 patch sets film-base multipliers.";
+            ? "Click an exposed backlight patch (no film). A 5 x 5 linear-input patch sets light normalization for the whole roll."
+            : "Click clear/unexposed developed film, not the image or holder. A 5 x 5 linear-input patch sets the film base for the whole roll.";
+    }
+
+    private async Task AutoPickAsync(CancellationToken token)
+    {
+        if (store is null || SelectedFrame is not { } frame)
+            throw new InvalidOperationException("Select a captured frame first.");
+        if (!store.Document.IsDemo) _ = Processor();
+        samplingTarget = null;
+        activityContext.Text = $"Frame {frame.Number} is saved. Looking for exposed light through sprocket holes and clear film between them.";
+        SetActivity("Preparing automatic picks", "Reading the uncropped linear input. Existing picks remain unchanged if detection fails.");
+        var changed = await FrameCalibration.AutoSampleAsync(store.Document, frame, draft,
+            Path.Combine(store.RootPath, "Working"), darktablePath, token, Progress());
+        await SaveDraftAsync(changed, token);
+        var picks = changed.PictureCalibration!;
+        static string Rgb(PictureSample sample) => $"({sample.Red:F3}, {sample.Green:F3}, {sample.Blue:F3})";
+        samplingLabel.Text = $"Automatic picks from frame {frame.Number} (linear RGB): light {Rgb(picks.Light!)}"
+            + (picks.FilmBase is { } basis ? $"; film {Rgb(basis)}" : "")
+            + ". Inspect the positive, then accept; manual pickers can override.";
+        await RenderAsync(token);
+        message.Text = "Automatic picks saved in the draft. Inspect the positive and accept this preview to apply them to the whole roll.";
     }
 
     private void PickPreviewPoint(object sender, PointerRoutedEventArgs args)
@@ -748,15 +850,22 @@ public sealed class RollWorkflowWindow : Window
             if (store is null || SelectedFrame is not { } frame)
                 throw new InvalidOperationException("Select a captured frame first.");
             if (!store.Document.IsDemo) _ = Processor();
+            activityContext.Text = $"Frame {frame.Number} is saved. Measuring the patch, then updating the positive preview.";
+            SetActivity("Reading picture sample", "Preparing the full-resolution linear input for the selected patch.");
             var changed = await FrameCalibration.SampleAsync(store.Document, frame, draft, target, x, y,
-                Path.Combine(store.RootPath, "Working"), darktablePath, token);
+                Path.Combine(store.RootPath, "Working"), darktablePath, token, Progress());
             await SaveDraftAsync(changed, token);
             samplingLabel.Text = $"{target} sampled from frame {frame.Number} at {x:P0}, {y:P0}. Saved in the roll recipe.";
             await RenderAsync(token);
+            if (PicksReady)
+            {
+                await AcceptAsync(token, keepPreview: true);
+                message.Text = "Preview rendered for the exact current recipe. Light and film picks are applied to the entire roll.";
+            }
         });
     }
 
-    private Task AcceptAsync(CancellationToken token)
+    private Task AcceptAsync(CancellationToken token, bool keepPreview = false)
     {
         token.ThrowIfCancellationRequested();
         if (store is null || previewedRecipe != draft || previewedFrame != SelectedFrame?.Id)
@@ -766,11 +875,16 @@ public sealed class RollWorkflowWindow : Window
             InvalidatePreview();
             throw new InvalidOperationException("The imported XMP changed since preview. Render it again before acceptance.");
         }
-        if (!HasLightReference() || !HasFilmBase())
-            throw new InvalidOperationException("Complete matching light references and (for negatives) a film-base reference are required before acceptance.");
+        if (!PicksReady)
+            throw new InvalidOperationException("Pick exposed light and, for negatives, clear film in a captured picture first.");
         var accepted = store.SaveRecipe(draft, true);
         draft = accepted with { Accepted = false, AcceptedAt = null };
-        InvalidatePreview();
+        if (keepPreview)
+        {
+            previewedRecipe = displayedRecipe = draft;
+            previewedXmpHash = XmpHash(draft);
+        }
+        else InvalidatePreview();
         message.Text = $"Accepted immutable recipe {accepted.Id}, revision {accepted.Revision}. Batch Export will use this revision.";
         return Task.CompletedTask;
     }
@@ -815,6 +929,8 @@ public sealed class RollWorkflowWindow : Window
             FrameExport Record(ExportState state, IReadOnlyList<string> files, string? error) =>
                 new(frame.Id, acceptedRecipe.Id, acceptedRecipe.Revision, state, files, error, DateTimeOffset.UtcNow);
             store.RecordExport(Record(ExportState.Processing, [], null));
+            activityContext.Text = $"Batch: {completed}/{candidates.Length} complete, {failed} failed. Exporting frame {frame.Number} with accepted revision {acceptedRecipe.Revision}.";
+            SetActivity("Starting frame export", $"Preparing saved frame {frame.Number}.");
             message.Text = $"Exporting frame {frame.Number}; accepted revision {acceptedRecipe.Revision}; {completed}/{candidates.Length} complete.";
             try
             {
@@ -823,6 +939,7 @@ public sealed class RollWorkflowWindow : Window
                 token.ThrowIfCancellationRequested();
                 if (!ValidOutputs(result.OutputFiles))
                     throw new InvalidDataException("Processor did not produce both a nonempty TIFF and JPG.");
+                SetActivity("Publishing positives", $"Moving validated frame {frame.Number} output into the positives folder.");
                 var positives = PublishPositives(frame, acceptedRecipe, result.OutputFiles, token);
                 store.RecordExport(Record(ExportState.Complete, positives, null));
                 try { PruneGeneratedImages(Path.GetDirectoryName(result.OutputFiles[0])!); }
@@ -909,8 +1026,32 @@ public sealed class RollWorkflowWindow : Window
         idleConfirmation.IsChecked = false;
         cameraReleased(released);
         message.Text = teardownError is null
-            ? "Camera released after explicit idle confirmation. Close workflow and reconnect in the parent to capture again."
-            : $"Camera released after idle confirmation; teardown error: {teardownError}. Close workflow to reconnect.";
+            ? "Camera released after explicit idle confirmation. Roll remains open; use Connect USB camera here to reconnect."
+            : $"Camera released after idle confirmation; teardown error: {teardownError}. Roll remains open; use Connect USB camera to reconnect.";
+    }
+
+    private async Task ConnectCameraAsync(CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        if (camera is not null || faultHeld)
+            throw new InvalidOperationException("Confirm the camera is idle and release it before reconnecting.");
+        if (demoSticky || store?.Document.IsDemo == true)
+            throw new InvalidOperationException("A DEMO / SYNTHETIC roll cannot use a real camera.");
+        message.Text = "Connect USB camera: roll remains open while camera setup is shown.";
+        CameraClient? connected;
+        connectingCamera = true;
+        try { connected = await connectCamera(this, root.XamlRoot); }
+        finally { connectingCamera = false; }
+        if (connected is null)
+        {
+            message.Text = "Camera connection canceled. Roll remains open and unchanged; use Connect USB camera to retry.";
+            return;
+        }
+        camera = connected;
+        source = new RealCameraCaptureSource(connected);
+        idleConfirmation.IsChecked = false;
+        message.Text = $"{connected.Connection?.Model} connected. Roll, frames and recipe edits retained. " +
+            "The saved light and film picks still apply; keep camera exposure and lighting unchanged.";
     }
 
     private async Task<string?> PickRollAsync(CancellationToken token)
@@ -1049,7 +1190,7 @@ public sealed class RollWorkflowWindow : Window
             sourceLabel.Visibility = document is null && !lightHeld ? Visibility.Visible : Visibility.Collapsed;
             warnings.Visibility = capturing ? Visibility.Collapsed : Visibility.Visible;
             message.Visibility = faultHeld ? Visibility.Collapsed : Visibility.Visible;
-            sourceLabel.Text = source?.Description ?? "NO CAMERA SOURCE - explicitly choose Demo camera, or close and connect a real camera in the parent.";
+            sourceLabel.Text = source?.Description ?? "NO CAMERA SOURCE - use Connect USB camera here, or explicitly choose Demo camera.";
             if (synthetic) sourceLabel.Text = "DEMO / SYNTHETIC - NOT CAMERA PHOTOGRAPHS. " + sourceLabel.Text;
             foreach (var control in lockedControls) control.IsEnabled = !busy && !faultHeld;
             create.IsEnabled &= source is not null && store is null;
@@ -1065,17 +1206,16 @@ public sealed class RollWorkflowWindow : Window
             }
             cancel.IsEnabled = busy && !closing;
             close.IsEnabled = !faultHeld && !closing;
-            release.Visibility = faultHeld ? Visibility.Visible : Visibility.Collapsed;
-            release.IsEnabled = faultHeld && !busy && idleConfirmation.IsChecked == true;
-            idleConfirmation.Visibility = faultHeld ? Visibility.Visible : Visibility.Collapsed;
-            idleConfirmation.IsEnabled = faultHeld && !busy;
+            connect.Visibility = !synthetic && camera is null ? Visibility.Visible : Visibility.Collapsed;
+            connect.IsEnabled = camera is null && !synthetic && !busy && !faultHeld && !closing;
+            release.Visibility = camera is not null ? Visibility.Visible : Visibility.Collapsed;
+            release.IsEnabled = camera is not null && !busy && !closing && idleConfirmation.IsChecked == true;
+            idleConfirmation.Visibility = camera is not null ? Visibility.Visible : Visibility.Collapsed;
+            idleConfirmation.IsEnabled = camera is not null && !busy && !closing;
             capturePanel.Visibility = document is not null && phase != WorkflowPhase.Export && !lightHeld ? Visibility.Visible : Visibility.Collapsed;
             exportPanel.Visibility = phase == WorkflowPhase.Export ? Visibility.Visible : Visibility.Collapsed;
-            lightReference.Visibility = filmBase.Visibility = phase == WorkflowPhase.References ? Visibility.Visible : Visibility.Collapsed;
             nextFrame.Visibility = phase == WorkflowPhase.Capture ? Visibility.Visible : Visibility.Collapsed;
-            lightReference.IsEnabled &= store is not null && source is not null;
-            filmBase.IsEnabled &= store is not null && source is not null && HasSessionReference(CapturePurpose.LightReference);
-            nextFrame.IsEnabled &= store is not null && source is not null && CaptureReferencesReady();
+            nextFrame.IsEnabled &= store is not null && source is not null;
             nextFrame.Content = $"Capture frame {(document?.Captures.Where(c => c.Purpose == CapturePurpose.Frame).Select(c => c.Number).DefaultIfEmpty(0).Max() ?? 0) + 1}";
             var selected = SelectedFrame?.Id;
             var choices = document?.Captures.Where(c => c.Purpose == CapturePurpose.Frame).OrderBy(c => c.Number)
@@ -1086,15 +1226,19 @@ public sealed class RollWorkflowWindow : Window
             var canSample = displayedFrame == SelectedFrame?.Id && displayedRecipe == draft && positiveBitmap is not null;
             pickBacklight.IsEnabled &= canSample && sourceBitmap is not null;
             pickFilmBase.IsEnabled &= canSample && sourceBitmap is not null && document?.FilmKind != FilmKind.Positive;
+            autoPicks.IsEnabled &= SelectedFrame is not null && store is not null;
+            autoPicks.Content = document?.FilmKind == FilmKind.Positive ? "Auto-pick light" : "Auto-pick light + base";
             sourceView.IsEnabled &= sourceBitmap is not null;
+            resetPicks.IsEnabled &= SelectedFrame is not null && store is not null;
             developSettings.IsEnabled &= store is not null;
             accept.IsEnabled &= previewedRecipe == draft && previewedFrame == SelectedFrame?.Id
-                && previewedRecipe is not null && HasLightReference() && HasFilmBase();
+                && previewedRecipe is not null && PicksReady;
             batch.IsEnabled &= AcceptedRecipe() is not null;
             retry.IsEnabled &= AcceptedRecipe() is not null && SelectedFrame is not null;
             showOutputs.IsEnabled &= store is not null && Directory.Exists(PositiveRoot);
-            recipeLabel.Text = $"Current edits: {draft.Id}, revision {draft.Revision} (unaccepted until preview + accept).\nXMP: {draft.XmpTemplatePath ?? "not imported"}\ndarktable: {darktablePath ?? "not selected"}";
             var accepted = AcceptedRecipe();
+            var applied = accepted is not null && draft == (accepted with { Accepted = false, AcceptedAt = null });
+            recipeLabel.Text = $"Current settings: {draft.Id}, revision {draft.Revision} ({(applied ? "applied to the whole roll" : "unaccepted until preview + accept")}).\nXMP: {draft.XmpTemplatePath ?? "not imported"}\ndarktable: {darktablePath ?? "not selected"}";
             exportLabel.Text = accepted is null ? "No accepted recipe." :
                 $"{(synthetic ? "SIMULATED / SYNTHETIC EXPORTS\n" : "")}Export uses ACCEPTED {accepted.Id}, revision {accepted.Revision}.\nUnaccepted Develop edits are NEVER exported.\nPositive TIFF/JPEG only: {PositiveRoot}";
             jobs.Text = string.Join("\n", document?.Exports.Select(e =>
@@ -1106,13 +1250,9 @@ public sealed class RollWorkflowWindow : Window
             foreach (var pair in recipeValues) pair.Value.Text = $"{pair.Key}: {values[index++]:0.00}";
             warnings.Text = (synthetic ? "DEMO / SYNTHETIC. Simulated inputs and outputs, not real-camera processing.\n" : "") +
                 (faultHeld ? "CAMERA FAULT: LIGHT AND SOURCE LEASE HELD. Confirm idle before release, navigation or closing.\n" : "") +
-                (document is not null && !HasLightReference() ? "Complete matching no-film light reference required.\n" : "") +
-                (document is not null && !HasFilmBase() ? "Negatives require a film-base reference before acceptance.\n" : "") + lastWarning;
-            if (!synthetic && phase is WorkflowPhase.Develop or WorkflowPhase.Export)
-                warnings.Text = "REAL processing requires darktable 5.6.2 and UNCOMPRESSED or LOSSLESS COMPRESSED RAF (RAW or RAW+JPEG). JPEG-only and lossy RAF are not processing inputs. Keep physical exposure fixed across references/frames; originals remain untouched. Approve negadoctor's starting print settings in the preview.\n" + warnings.Text;
-            if (!synthetic && document is not null && source is not null && !CaptureReferencesReady()
-                && phase is WorkflowPhase.References or WorkflowPhase.Capture)
-                warnings.Text = "Capture fresh light/base references for this camera lease before adding frames. Existing references remain available for previously captured frames.\n" + warnings.Text;
+                (document is not null && !PicksReady ? $"Capture a picture and pick {RequiredPicks}. This draft is provisional and cannot be exported; any previously accepted revision remains available.\n" : "") + lastWarning;
+            if (!synthetic)
+                warnings.Text += "\nPositive previews require RAW or RAW+JPEG with UNCOMPRESSED or LOSSLESS COMPRESSED RAF and darktable 5.6.2. No separate reference photos are needed. Keep camera exposure and lighting fixed; originals remain untouched.";
             if (faultHeld)
                 warnings.Text = $"CAMERA FAULT: light and lease retained. Confirm physical idle before releasing.\n{message.Text}";
         }

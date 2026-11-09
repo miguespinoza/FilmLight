@@ -1,7 +1,11 @@
 param(
     [string]$AppPath = "$PSScriptRoot\..\artifacts\FilmLight-arm64\FilmLight.exe",
     [string]$OutputParent = "$PSScriptRoot\..\artifacts\WorkflowSmoke-$([Guid]::NewGuid().ToString('N'))",
-    [ValidateSet('White', 'Rgb')][string]$CaptureMode = 'White'
+    [ValidateSet('White', 'Rgb')][string]$CaptureMode = 'White',
+    [switch]$ProbePreviewErrors,
+    [switch]$ProbeReconnect,
+    [switch]$ProbeProgress,
+    [string]$RawPath
 )
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName UIAutomationClient
@@ -13,6 +17,8 @@ public static class WorkflowWindows {
     [StructLayout(LayoutKind.Sequential)] public struct Point { public int X, Y; }
     [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr window, uint command);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr window);
+    [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(Point point);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr window, out uint process);
     [DllImport("user32.dll")] public static extern bool GetCursorPos(out Point point);
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint x, uint y, uint data, UIntPtr extra);
@@ -34,7 +40,10 @@ function Wait-Control([string]$Name, $Scope = $script:window, [switch]$Enabled, 
         if ($null -ne $control -and (!$Enabled -or $control.Current.IsEnabled)) { return $control }
         Start-Sleep -Milliseconds 80
     } while ([DateTime]::UtcNow -lt $deadline)
-    throw "Missing control: $Name"
+    $names = @($Scope.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+        [System.Windows.Automation.Condition]::TrueCondition) | ForEach-Object { $_.Current.Name } |
+        Where-Object { $_ } | Select-Object -Unique -First 55)
+    throw "Missing control: $Name. Controls: $($names -join '; ')"
 }
 
 function Invoke-Button([string]$Name, $Scope = $script:window) {
@@ -116,6 +125,9 @@ function Read-Roll {
 }
 
 function Pick-SourcePoint([double]$X, [double]$Y, [int]$ExpectedRevisions) {
+    if (![WorkflowWindows]::SetForegroundWindow([IntPtr]$script:window.Current.NativeWindowHandle)) {
+        throw 'Cannot foreground the workflow for the native picker check.'
+    }
     $image = Wait-Control 'Captured frame preview'
     $bounds = $image.Current.BoundingRectangle
     $scale = [Math]::Min($bounds.Width / 384, $bounds.Height / 256)
@@ -125,6 +137,13 @@ function Pick-SourcePoint([double]$X, [double]$Y, [int]$ExpectedRevisions) {
     if (![WorkflowWindows]::GetCursorPos([ref]$original)) { throw 'Cannot read cursor position for native picker check.' }
     try {
         if (![WorkflowWindows]::SetCursorPos([int]$px, [int]$py)) { throw 'Cannot position pointer over source image.' }
+        $actual = New-Object WorkflowWindows+Point
+        if (![WorkflowWindows]::GetCursorPos([ref]$actual)) { throw 'Cannot verify pointer position.' }
+        [uint32]$targetProcess = 0
+        [WorkflowWindows]::GetWindowThreadProcessId([WorkflowWindows]::WindowFromPoint($actual), [ref]$targetProcess) | Out-Null
+        if ($actual.X -ne [int]$px -or $actual.Y -ne [int]$py -or $targetProcess -ne $process.Id) {
+            throw "Picker target is obscured or offscreen: expected $px, $py in PID $($process.Id); actual $($actual.X), $($actual.Y) in PID $targetProcess."
+        }
         [WorkflowWindows]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)
         [WorkflowWindows]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)
     }
@@ -134,7 +153,12 @@ function Pick-SourcePoint([double]$X, [double]$Y, [int]$ExpectedRevisions) {
         if (@((Read-Roll).Recipes).Count -eq $ExpectedRevisions) { break }
         Start-Sleep -Milliseconds 80
     } while ([DateTime]::UtcNow -lt $deadline)
-    if (@((Read-Roll).Recipes).Count -ne $ExpectedRevisions) { throw 'Source picker did not save its calibration revision.' }
+    if (@((Read-Roll).Recipes).Count -ne $ExpectedRevisions) {
+        $state = @($script:window.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+            [System.Windows.Automation.Condition]::TrueCondition) | ForEach-Object { $_.Current.Name } |
+            Where-Object { $_ } | Select-Object -Unique -First 55)
+        throw "Source picker did not save its calibration revision. Point $px, $py; image bounds $bounds. Controls: $($state -join '; ')"
+    }
     Wait-Text 'Preview rendered for the exact current recipe' | Write-Output
 }
 
@@ -147,13 +171,167 @@ function Wait-CompletedExports([int]$Count) {
     throw "Expected $Count completed export history records."
 }
 
+function Assert-ActivityStopped {
+    $ring = Find-Control 'WorkflowActivityIndicator' -ById
+    if ($null -ne $ring -and !$ring.Current.IsOffscreen) {
+        throw 'Activity indicator remained visible after the operation finished.'
+    }
+}
+
 $OutputParent = [System.IO.Path]::GetFullPath($OutputParent)
 [System.IO.Directory]::CreateDirectory($OutputParent) | Out-Null
+if ($ProbePreviewErrors -or $ProbeReconnect -or $ProbeProgress) {
+    Add-Type -AssemblyName System.Drawing
+    $fixtureRoot = Join-Path $OutputParent $(if ($ProbeProgress) { 'RawProgressFixture' } else { 'JpegRejectionFixture' })
+    [System.IO.Directory]::CreateDirectory($fixtureRoot) | Out-Null
+    $id = [Guid]::NewGuid()
+    $directory = Join-Path $fixtureRoot "captures\$($id.ToString('N'))"
+    [System.IO.Directory]::CreateDirectory($directory) | Out-Null
+    if ($ProbeProgress) {
+        if (!$RawPath -or [System.IO.Path]::GetExtension($RawPath) -ine '.RAF') {
+            throw '-ProbeProgress requires -RawPath pointing to an existing supported RAF.'
+        }
+        $path = Join-Path $directory 'White.RAF'
+        Copy-Item -LiteralPath $RawPath -Destination $path
+        $originalHash = (Get-FileHash -LiteralPath $path).Hash
+    }
+    else {
+        $path = Join-Path $directory 'White.JPG'
+        $bitmap = New-Object System.Drawing.Bitmap 4, 4
+        try { $bitmap.Save($path, [System.Drawing.Imaging.ImageFormat]::Jpeg) }
+        finally { $bitmap.Dispose() }
+    }
+    $captures = @(@{
+        Id = $id; Number = 1; Purpose = 2; Mode = 0; Files = @(@{ Channel = 3; Path = $path })
+        IsDemo = $false; CapturedAt = [DateTimeOffset]::UtcNow.AddMinutes(-1).ToString('o')
+    })
+    $recipes = @()
+    if ($ProbeReconnect) {
+        $recipes = @(@{
+            Id = [Guid]::NewGuid(); Revision = 1; FilmKind = 0; XmpTemplatePath = $null
+            ExposureEv = 0; RedGain = 1; GreenGain = 1; BlueGain = 1
+            FilmBaseRed = 1; FilmBaseGreen = 1; FilmBaseBlue = 1; BlackPoint = 0; WhitePoint = 1
+            CropLeft = 0; CropTop = 0; CropRight = 0; CropBottom = 0; Accepted = $false; AcceptedAt = $null
+            PictureCalibration = @{
+                Light = @{ FrameId = $id; X = .1; Y = .5; Red = .8; Green = .7; Blue = .6 }
+                FilmBase = @{ FrameId = $id; X = .2; Y = .5; Red = .6; Green = .3; Blue = .2 }
+            }
+        })
+    }
+    @{
+        SchemaVersion = 1; Id = [Guid]::NewGuid()
+        Name = $(if ($ProbeProgress) { 'Saved RAW progress fixture - no camera connection' } else { 'JPEG rejection test fixture - not camera photographs' })
+        FilmKind = 0; IsDemo = $false; Phase = 2; Captures = $captures
+        Recipes = $recipes; Exports = @(); AcceptedRecipeId = $null; IntermediatesTrashed = $false
+    } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $fixtureRoot 'roll.json') -Encoding UTF8
+}
 $process = Start-Process -FilePath (Resolve-Path $AppPath) -PassThru
 try {
     $script:window = Wait-AppWindow 'Film Light'
     Invoke-Button 'Roll workflow'
     $script:window = Wait-AppWindow 'Film Light - Roll workflow'
+    if ($ProbePreviewErrors -or $ProbeReconnect -or $ProbeProgress) {
+        Invoke-Button 'Open / resume'
+        $edit = Wait-Control 'Existing roll folder path'
+        $edit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('relative-invalid-roll')
+        Invoke-Button 'Add existing roll'
+        Wait-Text 'Cannot add roll:' | Write-Output
+        if ((Wait-Control 'Resume roll').Current.IsEnabled) { throw 'Invalid roll path enabled Resume.' }
+        Select-SavedRoll $fixtureRoot -Add
+        Wait-Text 'Resumed ' | Write-Output
+        if ($ProbeProgress) {
+            $illumination = (Wait-Control 'Illumination area').Current.BoundingRectangle
+            Invoke-Button 'Render Preview'
+            Wait-Text 'Decoding RAW' 120 | Write-Output
+            $ring = Wait-Control 'WorkflowActivityIndicator' -ById
+            if ($ring.Current.IsOffscreen) { throw 'RAW decoding has no visible activity indicator.' }
+            $windowBounds = $script:window.Current.BoundingRectangle
+            if ($ring.Current.BoundingRectangle.Left -lt $windowBounds.Left + $windowBounds.Width / 2) {
+                throw 'Progress feedback overlaps the illumination area.'
+            }
+            $elapsedCondition = New-Object System.Windows.Automation.PropertyCondition(
+                [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'WorkflowActivityElapsed')
+            $clock = $script:window.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $elapsedCondition)
+            if ($null -eq $clock -or $clock.Current.IsOffscreen) { throw 'Elapsed time is not visible during RAW decoding.' }
+            $before = $clock.Current.Name
+            $deadline = [DateTime]::UtcNow.AddSeconds(5)
+            do {
+                Start-Sleep -Milliseconds 200
+                $after = $clock.Current.Name
+            } while ($after -eq $before -and [DateTime]::UtcNow -lt $deadline)
+            if ($before -notlike 'Elapsed * | Current stage *' -or $after -eq $before) {
+                throw 'Elapsed time does not advance while RAW decoding is running.'
+            }
+            if ((Wait-Control 'Render Preview').Current.IsEnabled -or !(Wait-Control 'Pause / cancel safely').Current.IsEnabled) {
+                throw 'Processing must disable duplicate renders while leaving safe cancellation available.'
+            }
+            Wait-Text 'Preview rendered for the exact current recipe' 180 | Write-Output
+            Wait-Control 'Render Preview' -Enabled | Out-Null
+            Assert-ActivityStopped
+            if ((Wait-Control 'Illumination area').Current.BoundingRectangle -ne $illumination) {
+                throw 'Progress feedback changed the illumination geometry.'
+            }
+            Invoke-Button 'Render Preview'
+            Wait-Text 'Loading cached RAW' 120 | Write-Output
+            Invoke-Button 'Pause / cancel safely'
+            Wait-Text 'Paused.' 30 | Write-Output
+            Wait-Control 'Render Preview' -Enabled | Out-Null
+            Assert-ActivityStopped
+            if ((Get-FileHash -LiteralPath $path).Hash -ne $originalHash) { throw 'Processing changed the original RAW input.' }
+            Write-Output 'PASS: visible RAW stages, advancing elapsed time, stable illumination, successful completion and safe cancellation without a stuck activity indicator.'
+            return
+        }
+        if ($ProbeReconnect) {
+            $manifestPath = Join-Path $fixtureRoot 'roll.json'
+            $before = (Get-FileHash -LiteralPath $manifestPath).Hash
+            $handle = $script:window.Current.NativeWindowHandle
+            foreach ($attempt in 1..2) {
+                Invoke-Button 'Connect USB camera'
+                Wait-Control 'Connect Fujifilm X-T5' | Out-Null
+                Invoke-Button 'Cancel'
+                Wait-Text 'Camera connection canceled.' | Write-Output
+                if ($script:window.Current.NativeWindowHandle -ne $handle) { throw 'Reconnect replaced the roll window.' }
+                if ((Get-FileHash -LiteralPath $manifestPath).Hash -ne $before) { throw 'Canceled reconnect changed the saved roll.' }
+                Wait-Control 'Connect USB camera' -Enabled | Out-Null
+                $selection = (Wait-Control 'Representative frame selection').GetCurrentPattern(
+                    [System.Windows.Automation.SelectionPattern]::Pattern).Current.GetSelection()
+                if ($selection.Count -ne 1 -or $selection[0].Current.Name -notlike 'Frame 1 -*') {
+                    throw 'Reconnect did not retain the selected frame.'
+                }
+            }
+            $helper = Join-Path (Split-Path (Resolve-Path $AppPath).Path -Parent) 'CameraHost\FilmLight.CameraHost.exe'
+            if (!(Test-Path -LiteralPath $helper)) {
+                Invoke-Button 'Connect USB camera'
+                $confirmation = Wait-Control 'Camera is idle and configured; no other tether app is running.'
+                $confirmation.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Toggle()
+                Invoke-Button 'Connect USB'
+                $failure = Wait-Text 'Operation failed:'
+                if ($failure -notlike '*Camera helper is missing*') { throw "Unexpected connection failure: $failure" }
+                Wait-Control 'Connect USB camera' -Enabled | Out-Null
+                if ((Get-FileHash -LiteralPath $manifestPath).Hash -ne $before) { throw 'Failed reconnect changed the saved roll.' }
+                Write-Output $failure
+            }
+            Invoke-Button 'Close workflow'
+            $script:window = Wait-AppWindow 'Film Light'
+            Invoke-Button 'Camera'
+            Wait-Control 'Connect Fujifilm X-T5' | Out-Null
+            Invoke-Button 'Cancel'
+            Write-Output 'PASS: in-roll camera setup can be canceled and retried without closing or changing the roll; parent camera setup still works.'
+            return
+        }
+        foreach ($attempt in 1..2) {
+            Invoke-Button 'Render Preview'
+            $failure = Wait-Text 'Operation failed:'
+            if ($failure -notmatch 'JPEG' -or $failure -notmatch 'RAW') {
+                throw "Preview did not expose the actionable input error: $failure"
+            }
+            if (!(Wait-Control 'Render Preview').Current.IsEnabled) { throw 'Preview failure left the workflow locked.' }
+            Assert-ActivityStopped
+            Write-Output $failure
+        }
+        Write-Output 'PASS: JPEG-only preview rejection is visible and retryable, not stuck showing Processing.'
+        return
+    }
     Invoke-Button 'Open / resume'
     Wait-Control 'SavedRolls' -ById | Out-Null
     Invoke-Button 'Cancel'
@@ -176,17 +354,14 @@ try {
     $script:manifest = Join-Path $rollRoot 'roll.json'
     if (!(Read-Roll).CreatedAt) { throw 'New roll has no persistent creation date.' }
 
-    Invoke-Button 'Capture NO-FILM reference'
-    Wait-Text 'LightReference 0 saved' | Write-Output
-    Invoke-Button 'Capture FILM BASE reference'
-    Wait-Text 'FilmBaseReference 0 saved' | Write-Output
-    Invoke-Button '2. Capture'
+    if ($null -ne (Find-Control 'Capture NO-FILM reference') -or $null -ne (Find-Control '1. References')) {
+        throw 'Separate reference calibration is still visible.'
+    }
+    Invoke-Button '1. Capture'
     Wait-Text 'Capture frames:' | Write-Output
     Invoke-Button 'Capture frame 1'
     Wait-Text 'Frame 1 saved' | Write-Output
-    Invoke-Button 'Capture frame 2'
-    Wait-Text 'Frame 2 saved' | Write-Output
-    Wait-Text 'SYNTHETIC - Frame 2 - positive preview' | Write-Output
+    Wait-Text 'SYNTHETIC - Frame 1 - positive preview' | Write-Output
     $previewBounds = (Wait-Control 'Captured frame preview').Current.BoundingRectangle
     $toolbarBounds = (Wait-Control 'Workflow toolbar').Current.BoundingRectangle
     $windowBounds = $script:window.Current.BoundingRectangle
@@ -201,15 +376,27 @@ try {
     Pick-SourcePoint (3.0 / 384) .5 1
     Invoke-Button 'Pick film base'
     Wait-Text 'Click clear/unexposed developed film' | Write-Output
-    Pick-SourcePoint (12.0 / 384) .5 2
+    Pick-SourcePoint (12.0 / 384) .5 3
     $picked = @((Read-Roll).Recipes)[-1]
-    if ($picked.Accepted -or [Math]::Abs($picked.RedGain - 1) -gt .001 -or
-        [Math]::Abs($picked.FilmBaseRed - 1) -gt .001) {
-        throw 'Synthetic backlight/base sampling did not save the expected unaccepted calibration.'
+    if (!$picked.Accepted -or !$picked.PictureCalibration.Light -or !$picked.PictureCalibration.FilmBase) {
+        throw 'The two mouse picks were not automatically applied to the entire roll.'
     }
+    $savedPicks = $picked.PictureCalibration | ConvertTo-Json -Compress
+    $origin = (Read-Roll).Captures[0].Id
+    if ($picked.PictureCalibration.Light.FrameId -ne $origin -or $picked.PictureCalibration.FilmBase.FrameId -ne $origin) {
+        throw 'Picture picks do not identify their source frame.'
+    }
+    Invoke-Button 'Capture frame 2'
+    Wait-Text 'Frame 2 saved. Positive preview uses the roll' | Write-Output
+    Wait-Text 'SYNTHETIC - Frame 2 - positive preview' | Write-Output
     $captured = Read-Roll
-    if ($captured.Captures.Count -ne 4 -or $captured.Exports.Count -ne 0) {
-        throw 'Capture phase did not retain two references/two frames separately from processing.'
+    if ($captured.Recipes.Count -ne 3 -or $captured.AcceptedRecipeId -ne $picked.Id -or
+        ($captured.Recipes[-1].PictureCalibration | ConvertTo-Json -Compress) -ne $savedPicks) {
+        throw 'Capturing another frame changed or discarded the saved roll-wide picture picks.'
+    }
+    if ($captured.Captures.Count -ne 2 -or $captured.Exports.Count -ne 0 -or
+        @($captured.Captures | Where-Object Purpose -ne 2).Count -ne 0) {
+        throw 'Capture should require only two pictures, with no separate references.'
     }
     $expectedMode = if ($CaptureMode -eq 'Rgb') { 1 } else { 0 }
     $expectedChannels = if ($CaptureMode -eq 'Rgb') { @(0, 1, 2) } else { @(3) }
@@ -227,7 +414,7 @@ try {
         foreach ($file in $capture.Files) { $inputHashes[$file.Path] = (Get-FileHash -LiteralPath $file.Path).Hash }
     }
 
-    Invoke-Button '3. Develop'
+    Invoke-Button '2. Develop'
     Invoke-Button 'Render Preview'
     Wait-Text 'Preview rendered for the exact current recipe' | Write-Output
     if (!(Wait-Control 'Accept this preview').Current.IsEnabled) { throw 'Successful preview did not enable acceptance.' }
@@ -239,7 +426,7 @@ try {
     Wait-Text 'Preview rendered for the exact current recipe' | Write-Output
     Invoke-Button 'Accept this preview'
     Wait-Text 'Accepted immutable recipe' | Write-Output
-    Invoke-Button '4. Export'
+    Invoke-Button '3. Export'
     Invoke-Button 'Export missing / failed'
     Wait-Text 'Batch finished: 2/2 complete, 0 failed.' 60 | Write-Output
     $exported = Read-Roll
@@ -274,12 +461,19 @@ try {
     Invoke-Button 'Use Demo camera'
     Wait-Text 'Resumed ' | Write-Output
     Wait-Text 'SIMULATED / SYNTHETIC EXPORTS' | Write-Output
+    if (((Read-Roll).Recipes[-1].PictureCalibration | ConvertTo-Json -Compress) -ne $savedPicks) {
+        throw 'Reopening the roll did not restore the picture picks.'
+    }
+    Invoke-Button '1. Capture'
+    Invoke-Button 'Render Preview'
+    Wait-Text 'Preview rendered for the exact current recipe' | Write-Output
+    Invoke-Button '3. Export'
     Invoke-Button 'Export missing / failed'
     Wait-Text 'Batch finished: 2/2 complete, 0 failed.' 60 | Write-Output
     if (@((Read-Roll).Exports | Where-Object State -eq 2).Count -ne 3) {
         throw 'Resume unnecessarily duplicated successful exports.'
     }
-    Write-Output "PASS: split capture/auto-preview, mouse WB/base pickers, four-phase DEMO workflow, preview invalidation/acceptance, TIFF/JPEG jobs, missing-output retry, reopen, unchanged captures. Artifacts: $rollRoot"
+    Write-Output "PASS: reference-free capture/auto-preview, roll-wide mouse light/film picks, TIFF/JPEG jobs, missing-output retry, reopen, unchanged captures. Artifacts: $rollRoot"
 }
 finally {
     if (!$process.HasExited) { Stop-Process -Id $process.Id }

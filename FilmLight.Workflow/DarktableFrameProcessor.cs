@@ -33,8 +33,11 @@ public sealed class DarktableFrameProcessor : IFrameProcessor
     }
 
     public Task<FrameProcessingResult> ExportAsync(RollDocument roll, RollCapture frame, DevelopRecipe recipe,
-        string outputDirectory, IProgress<ProcessingProgress>? progress, CancellationToken cancellationToken) =>
-        ProcessAsync(roll, frame, recipe, outputDirectory, progress, cancellationToken);
+        string outputDirectory, IProgress<ProcessingProgress>? progress, CancellationToken cancellationToken)
+    {
+        recipe.PictureCalibration?.RequireComplete(recipe.FilmKind);
+        return ProcessAsync(roll, frame, recipe, outputDirectory, progress, cancellationToken);
+    }
 
     private Task<FrameProcessingResult> ProcessAsync(RollDocument roll, RollCapture frame, DevelopRecipe recipe,
         string directory, IProgress<ProcessingProgress>? progress, CancellationToken token, bool forPreview = false)
@@ -42,27 +45,35 @@ public sealed class DarktableFrameProcessor : IFrameProcessor
         var warnings = new List<string>
         {
             "Rendered positives, not reversible raw. RAW decoding uses a fixed standard-camera matrix and unity processing white balance, not adaptive per-frame camera WB.",
-            "References assume identical physically controlled camera exposure, focus, registration and stable light. No camera/hardware validation is implied."
+            "Keep camera exposure, focus and illumination fixed across the roll. No camera/hardware validation is implied."
         };
         if (roll.IsDemo) warnings.Add(ProcessingImages.SyntheticLabel);
-        if (frame.Mode == CaptureMode.Rgb)
+        if (recipe.PictureCalibration is { } picture && !picture.IsComplete(recipe.FilmKind))
+            warnings.Add("Provisional positive preview: pick exposed light and, for negatives, clear film in this picture. These picks will be used for every frame.");
+        if (frame.Mode == CaptureMode.Rgb && recipe.PictureCalibration is not null)
+            warnings.Add("RGB uses each selected primary divided by the picked light channel. Point samples correct global color/film base, not spatial light falloff or spectral crosstalk.");
+        else if (frame.Mode == CaptureMode.Rgb)
             warnings.Add("RGB uses per-primary selected camera channel divided by its matching no-film reference, NOT HDR averaging. Spectral crosstalk/colorimetry requires measured hardware qualification; not colorimetric scanner output.");
         if (recipe.XmpTemplatePath is null && recipe.FilmKind != FilmKind.Positive)
             warnings.Add("Bootstrapped negadoctor v2 print parameters are starting values, not a calibrated film-stock profile; approve the supervised preview or supply a negadoctor-only calibrated XMP.");
         return ProcessingPublication.RunAsync(directory, frame, recipe, roll.IsDemo, warnings,
             async staging =>
             {
+                void Report(string stage, string message) => progress?.Report(new(frame.Id, stage, message));
+                Report("Checking processor", "Checking darktable before converting the image.");
                 string version = await cli.RunAsync(["--version"], staging, "version", token).ConfigureAwait(false);
                 if (!Regex.IsMatch(version, @"(?m)^darktable 5\.6\.2(?:\s|$)"))
                     throw new NotSupportedException("This negadoctor wire recipe is validated only for darktable 5.6.2. Install/select that version; no default-history fallback is permitted.");
                 var decoded = await new CameraInputDecoder(cli).DecodeAsync(roll, frame,
-                    cameraCacheDirectory ?? directory, token).ConfigureAwait(false);
+                    cameraCacheDirectory ?? directory, token, recipe, progress).ConfigureAwait(false);
                 var decodedFrame = decoded.Captures.Single(c => c.Id == frame.Id);
+                Report("Normalizing film", "Applying the roll's light and film settings to the linear input.");
                 var reconstruction = await Task.Run(() =>
                     ReferenceReconstruction.Reconstruct(decoded, decodedFrame, recipe, false, token), token).ConfigureAwait(false);
                 var controls = recipe;
                 if (forPreview)
                 {
+                    Report("Preparing preview", "Cropping and sizing the image, then preparing the source view.");
                     reconstruction = reconstruction with { Image = ProcessingImages.CropForPreview(reconstruction.Image, recipe, token) };
                     controls = recipe with { CropLeft = 0, CropTop = 0, CropRight = 0, CropBottom = 0 };
                     ProcessingImages.WriteSourcePreview(Path.Combine(staging, "source-preview.jpg"), reconstruction.Image, controls, token);
@@ -82,6 +93,7 @@ public sealed class DarktableFrameProcessor : IFrameProcessor
                     reconstruction = reconstruction with { FilmBase = [1, 1, 1] };
                 }
                 string input = Path.Combine(staging, "normalized-linear.tif");
+                Report("Preparing positive conversion", "Writing normalized input and the develop recipe.");
                 ProcessingImages.WriteTiff(input, reconstruction.Image, true,
                     (roll.IsDemo ? ProcessingImages.SyntheticLabel + "; " : "") + ProcessingImages.LinearLabel,
                     token, ProcessingImages.LinearRec2020Profile());
@@ -89,9 +101,14 @@ public sealed class DarktableFrameProcessor : IFrameProcessor
                 NegadoctorXmp.Write(xmp, recipe, reconstruction.FilmBase, recipe.FilmKind != FilmKind.Positive);
                 // Freeze the effective XMP (including any external calibration) in this job before processing.
                 string rendered = Path.Combine(staging, "developed-linear.tif");
+                Report(recipe.FilmKind == FilmKind.Positive ? "Developing positive" : "Inverting negative",
+                    recipe.FilmKind == FilmKind.Positive
+                        ? "darktable is developing the positive image."
+                        : "darktable is converting the negative to a positive with negadoctor.");
                 string log = await ConvertAsync(input, xmp, rendered, "LIN_REC2020", 32, staging, "develop", token).ConfigureAwait(false);
                 if (recipe.FilmKind != FilmKind.Positive && !Regex.IsMatch(log, @"(?im)^\s*\u25cf\s+negadoctor\b"))
                     throw new InvalidDataException("darktable did not report enabled negadoctor in its verbose history. No positive export will be published; inspect develop logs/XMP.");
+                Report("Applying develop settings", "Reading the converted image and applying exposure, color and levels.");
                 var image = ProcessingImages.ReadLinear(rendered, token);
                 if (image.Width != reconstruction.Image.Width || image.Height != reconstruction.Image.Height)
                     throw new InvalidDataException("Unexpected darktable geometry; disable crop/orientation in the calibrated XMP.");
@@ -99,15 +116,19 @@ public sealed class DarktableFrameProcessor : IFrameProcessor
             },
             async (staging, image, tiff, jpeg) =>
             {
+                progress?.Report(new(frame.Id, "Preparing positive output", "Writing the developed linear image for output encoding."));
                 string positive = Path.Combine(staging, "positive-linear.tif");
                 ProcessingImages.WriteTiff(positive, image, true,
                     (roll.IsDemo ? ProcessingImages.SyntheticLabel + "; " : "") + ProcessingImages.LinearLabel,
                     token, ProcessingImages.LinearRec2020Profile());
                 string xmp = Path.Combine(staging, "output-positive.xmp");
                 NegadoctorXmp.Write(xmp, recipe, [1, 1, 1], false);
+                progress?.Report(new(frame.Id, "Encoding TIFF", "darktable is saving the 16-bit ProPhoto RGB master."));
                 await ConvertAsync(positive, xmp, tiff, "PROPHOTO_RGB", 16, staging, "tiff", token).ConfigureAwait(false);
+                progress?.Report(new(frame.Id, "Encoding JPEG", "darktable is saving the sRGB preview companion."));
                 await ConvertAsync(positive, xmp, jpeg, "SRGB", 16, staging, "jpeg", token).ConfigureAwait(false);
                 // Require profiles even on synthetic darktable output; the CLI path has the same guarantees.
+                progress?.Report(new(frame.Id, "Checking color profiles", "Validating the encoded master and preview."));
                 ProcessingImages.ValidateMaster(tiff, image.Width, image.Height, true, token);
                 ProcessingImages.ValidateJpeg(jpeg, image.Width, image.Height, true);
             }, progress, token);

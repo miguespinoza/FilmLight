@@ -101,6 +101,298 @@ public sealed class ProcessingTests : IDisposable
         Assert.True(Pixels(cropped.OutputFiles[0]).Max() > .5);
     }
 
+    [Theory]
+    [InlineData(CaptureMode.White)]
+    [InlineData(CaptureMode.Rgb)]
+    public async Task PictureSamplesAreAbsoluteAndReusedWithoutReferencesOrCompounding(CaptureMode mode)
+    {
+        var first = await Capture(CapturePurpose.Frame, mode, 1);
+        var second = await Capture(CapturePurpose.Frame, mode, 2);
+        var roll = new RollDocument { IsDemo = true, FilmKind = FilmKind.ColorNegative, Captures = [first, second] };
+        var recipe = new DevelopRecipe { FilmKind = roll.FilmKind, PictureCalibration = new() };
+        var processor = new DemoFrameProcessor();
+        var provisional = await processor.PreviewAsync(roll, first, recipe, root, null, default);
+        Assert.True(File.Exists(provisional.ImagePath));
+        Assert.True(File.Exists(provisional.SourceImagePath));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => processor.ExportAsync(roll, first, recipe, root, null, default));
+        recipe = await FrameCalibration.SampleAsync(roll, first, recipe, CalibrationTarget.FilmBase, 12.0 / 384, .5, root, null, default);
+        recipe = await FrameCalibration.SampleAsync(roll, first, recipe, CalibrationTarget.Backlight, 3.0 / 384, .5, root, null, default);
+        Assert.True(recipe.PictureCalibration!.IsComplete(roll.FilmKind));
+        var repeated = await FrameCalibration.SampleAsync(roll, first, recipe, CalibrationTarget.Backlight, 3.0 / 384, .5, root, null, default);
+        Assert.Equal(recipe, repeated);
+        var a = ReferenceReconstruction.Reconstruct(roll, first, recipe, true, default);
+        var b = ReferenceReconstruction.Reconstruct(roll, second, recipe, true, default);
+        Assert.Equal(a.FilmBase, b.FilmBase);
+        Assert.Equal(recipe.PictureCalibration.FilmBase!.Red / recipe.PictureCalibration.Light!.Red, a.FilmBase[0], 5);
+        var preview = await processor.PreviewAsync(roll, second, recipe, root, null, default);
+        var export = await processor.ExportAsync(roll, second, recipe, root, null, default);
+        Assert.Equal(File.ReadAllBytes(preview.ImagePath), File.ReadAllBytes(export.OutputFiles[1]));
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    public async Task PicturePickerRejectsDarkAndClippedRawPatches(float value)
+    {
+        var frame = await Capture(CapturePurpose.Frame, CaptureMode.White, 1);
+        var roll = new RollDocument { IsDemo = true, FilmKind = FilmKind.ColorNegative, Captures = [frame] };
+        var recipe = new DevelopRecipe { FilmKind = roll.FilmKind, PictureCalibration = new() };
+        var path = frame.Files[0].Path;
+        var image = ProcessingImages.ReadLinear(path, default, true);
+        Array.Fill(image.Pixels, value);
+        ProcessingImages.WriteTiff(path, image, true, ProcessingImages.SyntheticLabel + "; " + ProcessingImages.LinearLabel,
+            default, ProcessingImages.LinearRec2020Profile());
+        await Assert.ThrowsAsync<InvalidDataException>(() => FrameCalibration.SampleAsync(roll, frame, recipe,
+            CalibrationTarget.Backlight, .5, .5, root, null, default));
+    }
+
+    [Theory]
+    [InlineData(CaptureMode.White, false)]
+    [InlineData(CaptureMode.White, true)]
+    [InlineData(CaptureMode.Rgb, false)]
+    [InlineData(CaptureMode.Rgb, true)]
+    public async Task AutoPicksMeasureSprocketsAndInterHoleFilmInUncroppedLinearChannels(CaptureMode mode, bool vertical)
+    {
+        var frame = await Capture(CapturePurpose.Frame, mode, 1);
+        foreach (var file in frame.Files)
+        {
+            var image = PerforatedFilm(vertical);
+            // The unselected channels of an RGB exposure must not affect its samples.
+            int selected = file.Channel switch { LightChannel.Red => 0, LightChannel.Green => 1, _ => 2 };
+            if (mode == CaptureMode.Rgb)
+                for (int i = 0; i < image.Pixels.Length; i++)
+                    if (i % 3 != selected) image.Pixels[i] = .01f;
+            ProcessingImages.WriteTiff(file.Path, image, true,
+                ProcessingImages.SyntheticLabel + "; " + ProcessingImages.LinearLabel, default,
+                ProcessingImages.LinearRec2020Profile());
+        }
+        var roll = new RollDocument { IsDemo = true, FilmKind = FilmKind.ColorNegative, Captures = [frame] };
+        var recipe = new DevelopRecipe
+        {
+            FilmKind = roll.FilmKind, PictureCalibration = new(), CropLeft = .2, CropTop = .2,
+            CropRight = .2, CropBottom = .2, ExposureEv = .5, RedGain = 1.1, BlueGain = .9,
+            FilmBaseRed = 1.1, Accepted = true, AcceptedAt = DateTimeOffset.UtcNow
+        };
+        var changed = await FrameCalibration.AutoSampleAsync(roll, frame, recipe, root, null, default);
+        var light = Assert.IsType<PictureSample>(changed.PictureCalibration!.Light);
+        var basis = Assert.IsType<PictureSample>(changed.PictureCalibration.FilmBase);
+        Assert.Equal(frame.Id, light.FrameId);
+        Assert.Equal(frame.Id, basis.FrameId);
+        Assert.Equal(.8, light.Red, 5);
+        Assert.Equal(.7, light.Green, 5);
+        Assert.Equal(.6, light.Blue, 5);
+        Assert.Equal(.5, basis.Red, 5);
+        Assert.Equal(.25, basis.Green, 5);
+        Assert.Equal(.1, basis.Blue, 5);
+        Assert.True(vertical ? light.X < .2 || light.X > .8 : light.Y < .2 || light.Y > .8);
+        Assert.Equal(recipe with { PictureCalibration = changed.PictureCalibration, Accepted = false, AcceptedAt = null }, changed);
+        var reconstructed = ReferenceReconstruction.Reconstruct(roll, frame, changed, true, default);
+        Assert.Equal(.5 / .8 * recipe.FilmBaseRed, reconstructed.FilmBase[0], 5);
+        Assert.Equal(.25 / .7, reconstructed.FilmBase[1], 5);
+        Assert.Equal(.1 / .6, reconstructed.FilmBase[2], 5);
+        Assert.Equal(changed, await FrameCalibration.AutoSampleAsync(roll, frame, changed, root, null, default));
+    }
+
+    [Theory]
+    [InlineData("missing")]
+    [InlineData("two")]
+    [InlineData("clipped")]
+    [InlineData("conflicting")]
+    [InlineData("uneven")]
+    [InlineData("no-film")]
+    [InlineData("marked-film")]
+    public void AutoPicksRejectUnreliableGeometryAndMeasurements(string problem)
+    {
+        var image = PerforatedFilm(false, problem);
+        var error = Assert.Throws<InvalidDataException>(() =>
+            SprocketCalibration.Detect(image, Guid.NewGuid(), true, default));
+        Assert.Contains("Existing picks have not changed", error.Message);
+        Assert.Contains("manual pickers", error.Message);
+    }
+
+    [Fact]
+    public async Task AutoPicksLeaveOriginalRecipeUntouchedOnFailureAndHonorCancellation()
+    {
+        var frame = await Capture(CapturePurpose.Frame, CaptureMode.White, 1);
+        var roll = new RollDocument { IsDemo = true, FilmKind = FilmKind.ColorNegative, Captures = [frame] };
+        var picture = new PictureCalibration
+        {
+            Light = new(frame.Id, .1, .1, .8, .7, .6), FilmBase = new(frame.Id, .2, .1, .5, .25, .1)
+        };
+        var recipe = new DevelopRecipe
+        {
+            FilmKind = roll.FilmKind, PictureCalibration = picture, Accepted = true, AcceptedAt = DateTimeOffset.UtcNow
+        };
+        await Assert.ThrowsAsync<InvalidDataException>(() =>
+            FrameCalibration.AutoSampleAsync(roll, frame, recipe, root, null, default));
+        Assert.Same(picture, recipe.PictureCalibration);
+        Assert.True(recipe.Accepted);
+        using var cancel = new CancellationTokenSource();
+        cancel.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            FrameCalibration.AutoSampleAsync(roll, frame, recipe, root, null, cancel.Token));
+    }
+
+    [Fact]
+    public void AutoPicksForPositiveFilmNeedOnlyUnclippedHoleInteriors()
+    {
+        var picture = SprocketCalibration.Detect(PerforatedFilm(false, "marked-film"), Guid.NewGuid(), false, default);
+        Assert.NotNull(picture.Light);
+        Assert.Null(picture.FilmBase);
+        Assert.True(picture.IsComplete(FilmKind.Positive));
+    }
+
+    [Fact]
+    public void AutoPicksMapReducedDetectionToFullResolutionAndAcceptNeutralFilmBase()
+    {
+        var small = PerforatedFilm(true);
+        for (int i = 0; i < small.Pixels.Length; i += 3)
+            if (small.Pixels[i] == .5f)
+            {
+                small.Pixels[i] = .4f;
+                small.Pixels[i + 1] = .35f;
+                small.Pixels[i + 2] = .3f;
+            }
+        var full = new LinearImage(small.Width * 5, small.Height * 5, new float[small.Pixels.Length * 25]);
+        for (int y = 0; y < full.Height; y++)
+        for (int x = 0; x < full.Width; x++)
+            Array.Copy(small.Pixels, (y / 5 * small.Width + x / 5) * 3, full.Pixels, (y * full.Width + x) * 3, 3);
+        var picture = SprocketCalibration.Detect(full, Guid.NewGuid(), true, default);
+        var light = picture.Light!;
+        var basis = picture.FilmBase!;
+        Assert.Equal(.8, light.Red, 5);
+        Assert.Equal(.7, light.Green, 5);
+        Assert.Equal(.6, light.Blue, 5);
+        Assert.Equal(.5, basis.Red / light.Red, 5);
+        Assert.Equal(.5, basis.Green / light.Green, 5);
+        Assert.Equal(.5, basis.Blue / light.Blue, 5);
+        int lightIndex = ((int)(light.Y * full.Height) * full.Width + (int)(light.X * full.Width)) * 3;
+        int baseIndex = ((int)(basis.Y * full.Height) * full.Width + (int)(basis.X * full.Width)) * 3;
+        Assert.Equal(light.Red, full.Pixels[lightIndex], 5);
+        Assert.Equal(basis.Red, full.Pixels[baseIndex], 5);
+    }
+
+    [InstalledDarktableFact]
+    public async Task AutoPicksFeedMeasuredTransmissionToNegadoctorWithoutReferences()
+    {
+        var frame = await Capture(CapturePurpose.Frame, CaptureMode.White, 1);
+        ProcessingImages.WriteTiff(frame.Files[0].Path, PerforatedFilm(false), true,
+            ProcessingImages.SyntheticLabel + "; " + ProcessingImages.LinearLabel, default,
+            ProcessingImages.LinearRec2020Profile());
+        var roll = new RollDocument { IsDemo = true, FilmKind = FilmKind.ColorNegative, Captures = [frame] };
+        var recipe = await FrameCalibration.AutoSampleAsync(roll, frame,
+            new() { FilmKind = roll.FilmKind, CropTop = .25, CropBottom = .25 }, root, null, default);
+        var preview = await new DarktableFrameProcessor(Cli).PreviewAsync(roll, frame, recipe, root, null, default);
+        string job = Path.GetDirectoryName(preview.ImagePath)!;
+        var dt = System.Xml.Linq.XNamespace.Get("http://darktable.sf.net/");
+        var module = System.Xml.Linq.XDocument.Load(Path.Combine(job, "develop.xmp"))
+            .Descendants().Single(e => (string?)e.Attribute(dt + "operation") == "negadoctor");
+        var parameters = Convert.FromHexString(module.Attribute(dt + "params")!.Value);
+        Assert.Equal(.5 / .8, BitConverter.ToSingle(parameters, 4), 5);
+        Assert.Equal(.25 / .7, BitConverter.ToSingle(parameters, 8), 5);
+        Assert.Equal(.1 / .6, BitConverter.ToSingle(parameters, 12), 5);
+        Assert.Contains("negadoctor", File.ReadAllText(Path.Combine(job, "develop.stdout.log")));
+        Assert.True(File.Exists(preview.ImagePath));
+        Assert.False(recipe.Accepted);
+    }
+
+    [Fact]
+    public void AutoPicksHandleSprocketHolesCutByTheImageBoundary()
+    {
+        var source = PerforatedFilm(false);
+        var cropped = new LinearImage(source.Width, 200, new float[source.Width * 200 * 3]);
+        Array.Copy(source.Pixels, 28 * source.Width * 3, cropped.Pixels, 0, cropped.Pixels.Length);
+        var picture = SprocketCalibration.Detect(cropped, Guid.NewGuid(), true, default);
+        Assert.True(picture.Light!.Y < .05 || picture.Light.Y > .95);
+        Assert.Equal(.8, picture.Light.Red, 5);
+        Assert.Equal(.5, picture.FilmBase!.Red, 5);
+        var locations = SprocketCalibration.Locate(cropped, default);
+        Assert.Equal(picture.Light.X, locations.LightX);
+        Assert.Equal(picture.FilmBase.X, locations.FilmBaseX);
+    }
+
+    [Fact]
+    public void PreviewLocalizationDoesNotQualifyClippedColorsAsRawCalibration()
+    {
+        var image = PerforatedFilm(false, "clipped");
+        var locations = SprocketCalibration.Locate(image, default);
+        Assert.True(locations.LightY < .2 || locations.LightY > .8);
+        Assert.NotEqual(locations.LightX, locations.FilmBaseX);
+        Assert.Throws<InvalidDataException>(() => SprocketCalibration.Detect(image, Guid.NewGuid(), true, default));
+    }
+
+    [Fact]
+    public void AutoPicksUseHigherThresholdsForLowContrastClearFilm()
+    {
+        var image = PerforatedFilm(false);
+        for (int i = 0; i < image.Pixels.Length; i += 3)
+            if (image.Pixels[i] == .5f)
+            {
+                image.Pixels[i] = .77f;
+                image.Pixels[i + 1] = .67f;
+                image.Pixels[i + 2] = .57f;
+            }
+        var picture = SprocketCalibration.Detect(image, Guid.NewGuid(), true, default);
+        Assert.Equal(.8, picture.Light!.Red, 5);
+        Assert.Equal(.77, picture.FilmBase!.Red, 5);
+    }
+
+    private static LinearImage PerforatedFilm(bool vertical, string problem = "")
+    {
+        const int width = 384, height = 256;
+        var image = new LinearImage(vertical ? height : width, vertical ? width : height, new float[width * height * 3]);
+        for (int y = 0; y < height; y++)
+        for (int x = 0; x < width; x++)
+        {
+            bool strip = y is >= 8 and < 52 or >= 204 and < 248;
+            float[] color = strip ? [.5f, .25f, .1f] : [.08f, .09f, .07f];
+            if (problem == "no-film" && strip) color = [.8f, .7f, .6f];
+            if (problem == "conflicting" && y >= 204 && strip) color = [.3f, .15f, .06f];
+            if (problem == "marked-film" && strip && x % 4 < 2) color = [.01f, .01f, .01f];
+            int count = problem == "missing" ? 0 : problem == "two" ? 2 : 9;
+            for (int n = 0; n < count; n++)
+            {
+                int left = 35 + n * 34 + (problem == "uneven" && n % 2 == 0 ? 9 : 0);
+                if (x >= left && x < left + 18 && (y is >= 22 and < 36 or >= 220 and < 234))
+                    color = problem == "clipped" ? [1, .7f, .6f] : [.8f, .7f, .6f];
+            }
+            // Isolated dust should not bias medians; a bright scene patch is not a perforation.
+            if (x == 43 && y == 28) color = [.01f, .01f, .01f];
+            if (x is >= 80 and < 300 && y is >= 90 and < 140) color = [.8f, .7f, .6f];
+            int i = vertical ? (x * height + y) * 3 : (y * width + x) * 3;
+            Array.Copy(color, 0, image.Pixels, i, 3);
+        }
+        return image;
+    }
+
+    [InstalledDarktableFact]
+    public async Task DarktableCanRenderPicturePicksWithoutAnyReferenceCaptures()
+    {
+        var frame = await Capture(CapturePurpose.Frame, CaptureMode.White, 1);
+        var roll = new RollDocument { IsDemo = true, FilmKind = FilmKind.ColorNegative, Captures = [frame] };
+        var recipe = new DevelopRecipe { FilmKind = roll.FilmKind, PictureCalibration = new() };
+        var processor = new DarktableFrameProcessor(Cli);
+        var progress = new RecordingProcessingProgress();
+        var provisional = await processor.PreviewAsync(roll, frame, recipe, root, progress, default);
+        string[] stages = ["Preparing conversion", "Checking processor", "Reading linear input", "Normalizing film",
+            "Preparing preview", "Preparing positive conversion", "Inverting negative", "Applying develop settings",
+            "Saving positive images", "Preparing positive output", "Encoding TIFF", "Encoding JPEG",
+            "Checking color profiles", "Validating output", "Publishing output"];
+        Assert.Equal(stages, progress.Events.Select(p => p.Stage));
+        Assert.All(progress.Events, p =>
+        {
+            Assert.Equal(frame.Id, p.FrameId);
+            Assert.False(string.IsNullOrWhiteSpace(p.Message));
+        });
+        Assert.Contains(provisional.Warnings, w => w.Contains("Provisional"));
+        Assert.True(File.Exists(provisional.SourceImagePath));
+        recipe = await FrameCalibration.SampleAsync(roll, frame, recipe, CalibrationTarget.Backlight, 3.0 / 384, .5, root, null, default);
+        recipe = await FrameCalibration.SampleAsync(roll, frame, recipe, CalibrationTarget.FilmBase, 12.0 / 384, .5, root, null, default);
+        var export = await processor.ExportAsync(roll, frame, recipe, root, null, default);
+        Assert.Equal(2, export.OutputFiles.Count);
+        Assert.All(export.OutputFiles, p => Assert.True(File.Exists(p)));
+    }
+
     [Fact]
     public void PreviewPointMappingRejectsLetterboxesAndMapsScaledImageCoordinates()
     {
@@ -336,12 +628,32 @@ public sealed class ProcessingTests : IDisposable
     }
 
     [Fact]
+    public async Task CancelingAtOutputProgressRetainsDiagnosticsWithoutReportingPublication()
+    {
+        var (roll, frame, recipe) = await Roll(CaptureMode.White);
+        using var cancel = new CancellationTokenSource();
+        var progress = new RecordingProcessingProgress(p =>
+        {
+            if (p.Stage == "Saving positive images") cancel.Cancel();
+        });
+        var directory = Path.Combine(root, "canceled-progress");
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => new DemoFrameProcessor()
+            .PreviewAsync(roll, frame, recipe, directory, progress, cancel.Token));
+        Assert.DoesNotContain(progress.Events, p => p.Stage == "Publishing output");
+        var job = Assert.Single(Directory.GetDirectories(directory));
+        Assert.EndsWith(".partial", job);
+        Assert.True(File.Exists(Path.Combine(job, "failure.txt")));
+    }
+
+    [Fact]
     public async Task MissingOrFailingCliNeverPublishesSuccess()
     {
         var (roll, frame, recipe) = await Roll(CaptureMode.White);
         string output = Path.Combine(root, "failed");
+        var progress = new RecordingProcessingProgress();
         await Assert.ThrowsAnyAsync<Exception>(() => new DarktableFrameProcessor(
-            Path.Combine(root, "missing-darktable-cli.exe")).ExportAsync(roll, frame, recipe, output, null, default));
+            Path.Combine(root, "missing-darktable-cli.exe")).ExportAsync(roll, frame, recipe, output, progress, default));
+        Assert.Equal(["Preparing conversion", "Checking processor"], progress.Events.Select(p => p.Stage));
         string job = Assert.Single(Directory.GetDirectories(output));
         Assert.EndsWith(".partial", job);
         Assert.True(File.Exists(Path.Combine(job, "failure.txt")));
@@ -529,5 +841,16 @@ public sealed class ProcessingTests : IDisposable
             if (!OperatingSystem.IsWindows() || !File.Exists(Cli))
                 Skip = "Requires installed darktable 5.6.2; set FILMLIGHT_TEST_DARKTABLE to its CLI path.";
         }
+    }
+
+}
+
+internal sealed class RecordingProcessingProgress(Action<ProcessingProgress>? onReport = null) : IProgress<ProcessingProgress>
+{
+    internal List<ProcessingProgress> Events { get; } = [];
+    public void Report(ProcessingProgress value)
+    {
+        Events.Add(value);
+        onReport?.Invoke(value);
     }
 }

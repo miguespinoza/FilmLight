@@ -6,7 +6,7 @@ namespace FilmLight.Workflow;
 /// A synthetic workflow renderer, not a live-camera processing fallback.
 /// FilmBase* multiply measured clear-film transmissions; crop values are fractional edge removals.
 /// Exposure/gains/levels apply to positive linear samples, identically in preview and export.
-/// Acceptance and durable recipe/reference snapshots are the roll coordinator's responsibility.
+/// Acceptance and durable recipe/sample snapshots are the roll coordinator's responsibility.
 /// </summary>
 [SupportedOSPlatform("windows")]
 public sealed class DemoFrameProcessor : IFrameProcessor
@@ -20,8 +20,11 @@ public sealed class DemoFrameProcessor : IFrameProcessor
     }
 
     public Task<FrameProcessingResult> ExportAsync(RollDocument roll, RollCapture frame, DevelopRecipe recipe,
-        string outputDirectory, IProgress<ProcessingProgress>? progress, CancellationToken cancellationToken) =>
-        ProcessAsync(roll, frame, recipe, outputDirectory, progress, cancellationToken);
+        string outputDirectory, IProgress<ProcessingProgress>? progress, CancellationToken cancellationToken)
+    {
+        recipe.PictureCalibration?.RequireComplete(recipe.FilmKind);
+        return ProcessAsync(roll, frame, recipe, outputDirectory, progress, cancellationToken);
+    }
 
     private static Task<FrameProcessingResult> ProcessAsync(RollDocument roll, RollCapture frame, DevelopRecipe recipe,
         string directory, IProgress<ProcessingProgress>? progress, CancellationToken token, bool forPreview = false)
@@ -33,6 +36,7 @@ public sealed class DemoFrameProcessor : IFrameProcessor
         return ProcessingPublication.RunAsync(directory, frame, recipe, true, warnings,
             staging => Task.Run(() =>
             {
+                progress?.Report(new(frame.Id, "Rendering synthetic positive", "Applying roll settings to the simulated input."));
                 var reconstruction = ReferenceReconstruction.Reconstruct(roll, frame, recipe, true, token);
                 var image = forPreview ? ProcessingImages.CropForPreview(reconstruction.Image, recipe, token) : reconstruction.Image;
                 var controls = forPreview ? recipe with { CropLeft = 0, CropTop = 0, CropRight = 0, CropBottom = 0 } : recipe;

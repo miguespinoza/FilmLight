@@ -119,7 +119,7 @@ public sealed class RollStore
             if (draft.FilmKind != current.FilmKind)
                 throw new ArgumentException("Recipe film kind must match the roll.", nameof(draft));
             if (accept)
-                RequireReferences(current);
+                RequireCalibration(current, draft);
             var revision = checked(current.Recipes.Where(r => r.Id == draft.Id)
                 .Select(r => r.Revision).DefaultIfEmpty(0).Max() + 1);
             var xmp = draft.XmpTemplatePath is null ? null
@@ -205,7 +205,7 @@ public sealed class RollStore
                     RequireProperties<CaptureFile>(file);
             }
             foreach (var recipe in json.RootElement.GetProperty(nameof(RollDocument.Recipes)).EnumerateArray())
-                RequireProperties<DevelopRecipe>(recipe);
+                RequireProperties<DevelopRecipe>(recipe, nameof(DevelopRecipe.PictureCalibration));
             foreach (var export in json.RootElement.GetProperty(nameof(RollDocument.Exports)).EnumerateArray())
                 RequireProperties<FrameExport>(export);
             var result = json.RootElement.Deserialize<RollDocument>(JsonOptions)
@@ -265,6 +265,7 @@ public sealed class RollStore
             if (recipe is null)
                 throw new InvalidDataException("Null recipe.");
             ValidateRecipeValues(recipe);
+            recipe.PictureCalibration?.Validate(roll);
             if (recipe.FilmKind != roll.FilmKind
                 || recipe.Revision != checked(revisions.GetValueOrDefault(recipe.Id) + 1)
                 || recipe.Accepted != recipe.AcceptedAt.HasValue
@@ -274,7 +275,7 @@ public sealed class RollStore
             if (recipe.XmpTemplatePath is not null)
                 RequireFile(OwnedPath(recipe.XmpTemplatePath, "recipes"));
             if (recipe.Accepted)
-                RequireReferences(roll);
+                RequireCalibration(roll, recipe);
         }
         var latestAccepted = roll.Recipes.LastOrDefault(r => r.Accepted);
         if (roll.AcceptedRecipeId != latestAccepted?.Id)
@@ -320,19 +321,30 @@ public sealed class RollStore
 
     private static void ValidatePhase(RollDocument roll, WorkflowPhase phase)
     {
-        if (phase == WorkflowPhase.Capture
-            && (!roll.Captures.Any(c => c.Purpose == CapturePurpose.LightReference)
-                || (roll.FilmKind != FilmKind.Positive
-                    && !roll.Captures.Any(c => c.Purpose == CapturePurpose.FilmBaseReference))))
-            throw new InvalidOperationException("Capture requires light and, for negatives, film-base references.");
         if (phase == WorkflowPhase.Develop && !roll.Captures.Any(c => c.Purpose == CapturePurpose.Frame))
             throw new InvalidOperationException("Develop requires captured frames.");
         if (phase == WorkflowPhase.Export)
         {
-            RequireReferences(roll);
-            if (roll.AcceptedRecipeId is null)
+            var accepted = roll.Recipes.LastOrDefault(r => r.Accepted && r.Id == roll.AcceptedRecipeId);
+            if (accepted is null)
                 throw new InvalidOperationException("Export requires an accepted recipe.");
+            RequireCalibration(roll, accepted);
         }
+    }
+
+    private static void RequireCalibration(RollDocument roll, DevelopRecipe recipe)
+    {
+        if (recipe.PictureCalibration is not { } picture)
+        {
+            RequireReferences(roll);
+            return;
+        }
+        picture.Validate(roll);
+        picture.RequireComplete(recipe.FilmKind);
+        var frames = roll.Captures.Where(c => c.Purpose == CapturePurpose.Frame).ToArray();
+        if (frames.Length == 0)
+            throw new InvalidOperationException("Applying a recipe requires a captured picture.");
+        foreach (var frame in frames) picture.Validate(roll, frame.Mode);
     }
 
     private static void RequireReferences(RollDocument roll)
@@ -352,6 +364,8 @@ public sealed class RollStore
 
     private static void ValidateRecipeValues(DevelopRecipe recipe)
     {
+        recipe.PictureCalibration?.Light?.Validate();
+        recipe.PictureCalibration?.FilmBase?.Validate();
         CheckEnum(recipe.FilmKind, nameof(recipe.FilmKind));
         double[] positive = [recipe.RedGain, recipe.GreenGain, recipe.BlueGain,
             recipe.FilmBaseRed, recipe.FilmBaseGreen, recipe.FilmBaseBlue];

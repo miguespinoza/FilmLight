@@ -24,12 +24,13 @@ internal sealed class CameraInputDecoder(DarktableProcess cli)
     private const string Settings = "FilmLight-camera-input-v2-signed;darktable-5.6.2;standard-matrix;unity-user-WB;none;bilinear;CPU;float32;LIN_REC2020";
     private const string CameraInstructions =
         "Set IMAGE QUALITY to RAW or FINE+RAW and RAW RECORDING to UNCOMPRESSED or LOSSLESS COMPRESSED " +
-        "(not COMPRESSED). Lock shutter speed, aperture, ISO, focus and illumination for frames and references, then recapture.";
+        "(not COMPRESSED). Lock shutter speed, aperture, ISO, focus and illumination throughout the roll, then recapture.";
     private static readonly XNamespace Dt = "http://darktable.sf.net/";
     private static readonly XNamespace Rdf = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 
     internal async Task<RollDocument> DecodeAsync(RollDocument roll, RollCapture frame,
-        string stagingDirectory, CancellationToken token)
+        string stagingDirectory, CancellationToken token, DevelopRecipe? recipe = null,
+        IProgress<ProcessingProgress>? progress = null)
     {
         token.ThrowIfCancellationRequested();
         ArgumentException.ThrowIfNullOrWhiteSpace(stagingDirectory);
@@ -37,21 +38,36 @@ internal sealed class CameraInputDecoder(DarktableProcess cli)
             ?? throw new InvalidOperationException("The selected frame must belong to this roll.");
         if (selected.Purpose != CapturePurpose.Frame || selected.IsDemo != roll.IsDemo)
             throw new InvalidOperationException("Select a frame with the same real/demo provenance as the roll.");
-        var captures = new List<RollCapture> { selected, Reference(CapturePurpose.LightReference) };
-        if (roll.FilmKind != FilmKind.Positive) captures.Add(Reference(CapturePurpose.FilmBaseReference));
+        var captures = new List<RollCapture> { selected };
+        if (recipe?.PictureCalibration is { } picture)
+        {
+            picture.Validate(roll, selected.Mode);
+            foreach (var sample in new[] { picture.Light, picture.FilmBase }.OfType<PictureSample>())
+                if (captures.All(c => c.Id != sample.FrameId))
+                    captures.Add(roll.Captures.Single(c => c.Id == sample.FrameId));
+        }
+        else
+        {
+            captures.Add(Reference(CapturePurpose.LightReference));
+            if (roll.FilmKind != FilmKind.Positive) captures.Add(Reference(CapturePurpose.FilmBaseReference));
+        }
         var inputs = captures.SelectMany(c => SelectFiles(c).Select(f => (Capture: c, File: f))).ToArray();
         string cache = Path.GetFullPath(Path.Combine(stagingDirectory, "camera-input-cache"));
         string? version = null;
         var replacements = new Dictionary<Guid, List<CaptureFile>>();
         Exposure? exposure = null;
         (int Width, int Height)? dimensions = null;
-        foreach (var (capture, file) in inputs)
+        for (int inputIndex = 0; inputIndex < inputs.Length; inputIndex++)
         {
             token.ThrowIfCancellationRequested();
+            var (capture, file) = inputs[inputIndex];
+            void Report(string stage, string message) => progress?.Report(new(frame.Id, stage,
+                $"Input {inputIndex + 1} of {inputs.Length} - {CaptureLabel(capture)}, {file.Channel}: {message}"));
             string path = file.Path;
             int width, height;
             if (IsTiff(path))
             {
+                Report("Reading linear input", "Checking image dimensions, color profile and linear samples.");
                 var image = ReadQualified(path, capture.IsDemo, token);
                 (width, height) = (image.Width, image.Height);
             }
@@ -61,19 +77,20 @@ internal sealed class CameraInputDecoder(DarktableProcess cli)
                     throw new InvalidDataException("DEMO captures must contain qualified synthetic TIFFs, not camera RAWs.");
                 if (version is null)
                 {
+                    Report("Checking RAW decoder", "Checking the installed darktable version.");
                     string job = NewJob(cache);
                     version = await cli.RunAsync(["--version"], job, "version", token).ConfigureAwait(false);
                     if (!Regex.IsMatch(version, @"(?m)^darktable 5\.6\.2(?:\s|$)"))
                         throw new NotSupportedException("Camera input decoding requires darktable 5.6.2; no default-history fallback is permitted.");
                 }
-                var decoded = await DecodeRawAsync(path, cache, version, token).ConfigureAwait(false);
+                var decoded = await DecodeRawAsync(path, cache, version, token, Report).ConfigureAwait(false);
                 if (exposure is not null && !exposure.Matches(decoded.Exposure))
-                    throw new InvalidDataException("Frame/reference camera model or physical exposure differs. " + CameraInstructions);
+                    throw new InvalidDataException("Camera model or physical exposure differs from the sampled picture / references. Keep camera exposure fixed across the roll. " + CameraInstructions);
                 exposure ??= decoded.Exposure;
                 (path, width, height) = (decoded.Path, decoded.Width, decoded.Height);
             }
             if (dimensions is not null && dimensions.Value != (width, height))
-                throw new InvalidDataException("Frame and references must have identical decoded dimensions and registration.");
+                throw new InvalidDataException("Frame and sampled pictures / references must have identical decoded dimensions.");
             dimensions ??= (width, height);
             if (!replacements.TryGetValue(capture.Id, out var files))
                 replacements[capture.Id] = files = [];
@@ -116,29 +133,46 @@ internal sealed class CameraInputDecoder(DarktableProcess cli)
                      files.Count(f => IsJpeg(f.Path)) == 1)
                 yield return files.Single(f => IsRaw(f.Path));
             else
-                throw new InvalidDataException($"Capture {capture.Id}, {channel}: require one qualified TIFF, one RAF, or a RAF+JPEG pair. " +
+                throw new InvalidDataException($"{CaptureLabel(capture)}, {channel}: require one qualified TIFF, one RAF, or a RAF+JPEG pair. " +
                     "Camera JPEG is rendered, not linear RAW, and cannot be used for processing. " + CameraInstructions);
         }
     }
 
-    private async Task<Decoded> DecodeRawAsync(string original, string cache, string version, CancellationToken token)
+    private static string CaptureLabel(RollCapture capture) => capture.Purpose switch
     {
+        CapturePurpose.Frame => $"Frame {capture.Number}",
+        CapturePurpose.LightReference => "NO-FILM light reference",
+        CapturePurpose.FilmBaseReference => "FILM BASE reference",
+        _ => $"Capture {capture.Id}"
+    };
+
+    private async Task<Decoded> DecodeRawAsync(string original, string cache, string version, CancellationToken token,
+        Action<string, string> report)
+    {
+        report("Checking RAW cache", "Reading the original RAW fingerprint for reusable decoded input.");
         await using var source = new FileStream(original, FileMode.Open, FileAccess.Read, FileShare.Read,
             1024 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
         string hash = Convert.ToHexString(await SHA256.HashDataAsync(source, token).ConfigureAwait(false));
         string key = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(Settings + "\n" + version + "\n" + hash)));
         string published = Path.Combine(cache, key);
-        if (Directory.Exists(published)) return await ReadCacheAsync(published, token).ConfigureAwait(false);
+        if (Directory.Exists(published))
+        {
+            report("Loading cached RAW", "Checking and reading the previously decoded linear image.");
+            return await ReadCacheAsync(published, token).ConfigureAwait(false);
+        }
         string job = NewJob(cache);
         try
         {
             source.Position = 0;
+            report("Preparing RAW", "Copying the RAW into a private processing job.");
             string input = Path.Combine(job, "input.RAF");
             await using (var copy = new FileStream(input, FileMode.CreateNew, FileAccess.Write, FileShare.None,
                 1024 * 1024, FileOptions.Asynchronous))
                 await source.CopyToAsync(copy, token).ConfigureAwait(false);
             WriteIdentityXmp(Path.Combine(job, "identity.xmp"), raw: true);
+            report("Decoding RAW", "darktable is decoding the full-resolution sensor image. The first conversion can take a while.");
             string log = await ConvertAsync(cli, job, "input.RAF", "decoded.tif", token).ConfigureAwait(false);
+            report("Validating decoded RAW", "Checking exposure metadata, color profile and linear samples.");
             string errors = await File.ReadAllTextAsync(Path.Combine(job, "decode.stderr.log"), token).ConfigureAwait(false);
             ValidateHistory(log, errors, raw: true);
             string output = Path.Combine(job, "decoded.tif");
@@ -146,6 +180,7 @@ internal sealed class CameraInputDecoder(DarktableProcess cli)
             ValidateFloatProfile(output);
             var image = ProcessingImages.ReadLinear(output, token);
             string result = Path.Combine(job, "linear.tif");
+            report("Saving RAW cache", "Saving and verifying reusable linear input for later previews.");
             ProcessingImages.WriteTiff(result, image, true, ProcessingImages.LinearLabel, token,
                 ProcessingImages.LinearRec2020Profile());
             _ = ReadQualified(result, false, token);

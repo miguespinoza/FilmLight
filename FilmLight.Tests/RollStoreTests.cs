@@ -111,6 +111,48 @@ public sealed class RollStoreTests : IDisposable
     }
 
     [Fact]
+    public void PicturePicksReplaceReferencesAndSurviveReopenForEveryFrame()
+    {
+        var store = Create(FilmKind.ColorNegative);
+        store.SetPhase(WorkflowPhase.Capture);
+        var first = Capture(store);
+        var second = Capture(store);
+        var light = new PictureSample(first.Id, .1, .2, .8, .7, .6);
+        var basis = new PictureSample(first.Id, .3, .4, .6, .3, .2);
+        var recipe = new DevelopRecipe
+        {
+            FilmKind = FilmKind.ColorNegative, PictureCalibration = new() { Light = light }
+        };
+        Assert.Throws<InvalidOperationException>(() => store.SaveRecipe(recipe, true));
+        var accepted = store.SaveRecipe(recipe with { PictureCalibration = new() { Light = light, FilmBase = basis } }, true);
+        store.SetPhase(WorkflowPhase.Export);
+        var reopened = RollStore.Open(Root);
+        Assert.Equal(accepted, reopened.Document.Recipes.Single());
+        Assert.Equal([first.Id, second.Id], reopened.Document.Captures.Select(c => c.Id));
+        Assert.All(reopened.Document.Captures, c => Assert.Equal(CapturePurpose.Frame, c.Purpose));
+        Assert.Throws<InvalidOperationException>(() => store.SaveRecipe(recipe with
+        {
+            PictureCalibration = new() { Light = light with { FrameId = Guid.NewGuid() }, FilmBase = basis }
+        }, false));
+        Assert.Throws<ArgumentException>(() => store.SaveRecipe(recipe with
+        {
+            PictureCalibration = new() { Light = light with { Red = double.NaN }, FilmBase = basis }
+        }, false));
+    }
+
+    [Fact]
+    public void OlderRecipesWithoutPictureCalibrationRemainReadable()
+    {
+        var store = Ready();
+        var saved = store.SaveRecipe(new DevelopRecipe { FilmKind = FilmKind.Positive }, true);
+        var manifest = Path.Combine(Root, "roll.json");
+        var json = JsonNode.Parse(File.ReadAllText(manifest))!.AsObject();
+        json["Recipes"]![0]!.AsObject().Remove(nameof(DevelopRecipe.PictureCalibration));
+        File.WriteAllText(manifest, json.ToJsonString());
+        Assert.Equal(saved, RollStore.Open(Root).Document.Recipes.Single());
+    }
+
+    [Fact]
     public void AcceptedRevisionsAndXmpRemainImmutableWhenLaterDraftsAreSaved()
     {
         var store = Ready();

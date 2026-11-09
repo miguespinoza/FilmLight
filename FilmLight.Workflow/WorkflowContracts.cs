@@ -12,6 +12,42 @@ public sealed record CaptureFile(LightChannel Channel, string Path);
 public sealed record RollCapture(Guid Id, int Number, CapturePurpose Purpose, CaptureMode Mode,
     IReadOnlyList<CaptureFile> Files, bool IsDemo, DateTimeOffset CapturedAt);
 
+public sealed record PictureSample(Guid FrameId, double X, double Y, double Red, double Green, double Blue)
+{
+    internal void Validate()
+    {
+        if (FrameId == Guid.Empty || !double.IsFinite(X) || !double.IsFinite(Y)
+            || X < 0 || X >= 1 || Y < 0 || Y >= 1
+            || new[] { Red, Green, Blue }.Any(v => !double.IsFinite(v) || v <= .0001 || v >= .99999))
+            throw new ArgumentException("Pick an unclipped, evenly lit patch inside the image, away from dark holder edges.");
+    }
+}
+
+public sealed record PictureCalibration
+{
+    public PictureSample? Light { get; init; }
+    public PictureSample? FilmBase { get; init; }
+
+    public bool IsComplete(FilmKind filmKind) => Light is not null && (filmKind == FilmKind.Positive || FilmBase is not null);
+
+    internal void RequireComplete(FilmKind filmKind)
+    {
+        if (!IsComplete(filmKind))
+            throw new InvalidOperationException("Pick exposed light and, for negatives, clear film in a captured picture before exporting the roll.");
+    }
+
+    internal void Validate(RollDocument roll, CaptureMode? mode = null)
+    {
+        foreach (var sample in new[] { Light, FilmBase }.OfType<PictureSample>())
+        {
+            sample.Validate();
+            if (!roll.Captures.Any(c => c.Id == sample.FrameId && c.Purpose == CapturePurpose.Frame
+                && c.IsDemo == roll.IsDemo && (!mode.HasValue || c.Mode == mode)))
+                throw new InvalidOperationException("Picture samples must come from a captured frame in this roll with the same capture mode.");
+        }
+    }
+}
+
 public sealed record DevelopRecipe
 {
     public Guid Id { get; init; } = Guid.NewGuid();
@@ -33,6 +69,7 @@ public sealed record DevelopRecipe
     public double CropBottom { get; init; }
     public bool Accepted { get; init; }
     public DateTimeOffset? AcceptedAt { get; init; }
+    public PictureCalibration? PictureCalibration { get; init; }
 }
 
 public sealed record FrameExport(Guid FrameId, Guid RecipeId, int RecipeRevision,
@@ -46,7 +83,7 @@ public sealed record RollDocument
     public DateTimeOffset? CreatedAt { get; init; }
     public FilmKind FilmKind { get; init; }
     public bool IsDemo { get; init; }
-    public WorkflowPhase Phase { get; init; }
+    public WorkflowPhase Phase { get; init; } = WorkflowPhase.Capture;
     public List<RollCapture> Captures { get; init; } = [];
     public List<DevelopRecipe> Recipes { get; init; } = [];
     public List<FrameExport> Exports { get; init; } = [];

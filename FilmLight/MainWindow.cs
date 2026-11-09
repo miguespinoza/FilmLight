@@ -451,6 +451,17 @@ public sealed class MainWindow : Window
             return;
         }
 
+        try { await ConnectCameraAsync(this, root.XamlRoot); }
+        catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException or System.ComponentModel.Win32Exception)
+        {
+            ShowError($"Camera connection failed: {ex.Message}");
+        }
+    }
+
+    private async Task<CameraClient?> ConnectCameraAsync(Window owner, XamlRoot dialogRoot)
+    {
+        if (camera is not null || connecting || running)
+            throw new InvalidOperationException("Release the current camera and wait for pending operations before connecting.");
         var panel = new StackPanel { Spacing = 12 };
         panel.Children.Add(new TextBlock
         {
@@ -459,39 +470,41 @@ public sealed class MainWindow : Window
         });
         var sdkPath = new TextBlock { Text = settings.SdkPath, TextWrapping = TextWrapping.Wrap, FontSize = 13 };
         var outputPath = new TextBlock { Text = settings.OutputPath, TextWrapping = TextWrapping.Wrap, FontSize = 13 };
+        var pickerError = new TextBlock { TextWrapping = TextWrapping.Wrap, Foreground = new SolidColorBrush(Colors.Orange) };
         var sdkFolder = MakeButton("SDK folder", 160);
         var outputFolder = MakeButton("Save folder", 160);
         sdkFolder.Click += async (_, _) =>
         {
-            var path = await PickFolderAsync();
+            var path = await PickFolderAsync(owner, pickerError);
             if (path is null) return;
             settings = settings with { SdkDirectory = path };
             sdkPath.Text = path;
-            Persist();
+            Persist(pickerError);
         };
         outputFolder.Click += async (_, _) =>
         {
-            var path = await PickFolderAsync();
+            var path = await PickFolderAsync(owner, pickerError);
             if (path is null) return;
             settings = settings with { OutputDirectory = path };
             outputPath.Text = path;
-            Persist();
+            Persist(pickerError);
         };
         panel.Children.Add(sdkFolder);
         panel.Children.Add(sdkPath);
         panel.Children.Add(outputFolder);
         panel.Children.Add(outputPath);
+        panel.Children.Add(pickerError);
         var ready = new CheckBox { Content = "Camera is idle and configured; no other tether app is running." };
         panel.Children.Add(ready);
         var connectDialog = new ContentDialog
         {
-            XamlRoot = root.XamlRoot, RequestedTheme = ElementTheme.Dark, Title = "Connect Fujifilm X-T5",
+            XamlRoot = dialogRoot, RequestedTheme = ElementTheme.Dark, Title = "Connect Fujifilm X-T5",
             Content = new ScrollViewer { Content = panel, MaxHeight = 500 },
             PrimaryButtonText = "Connect USB", CloseButtonText = "Cancel", IsPrimaryButtonEnabled = false
         };
         ready.Checked += (_, _) => connectDialog.IsPrimaryButtonEnabled = true;
         ready.Unchecked += (_, _) => connectDialog.IsPrimaryButtonEnabled = false;
-        if (await connectDialog.ShowAsync() != ContentDialogResult.Primary) return;
+        if (await connectDialog.ShowAsync() != ContentDialogResult.Primary) return null;
         connecting = true;
         UpdateCameraActivity(new(CameraStage.Loading, "Starting USB detection"));
         Refresh();
@@ -506,13 +519,14 @@ public sealed class MainWindow : Window
             pending = null;
             error.Text = "";
             status.Text = $"{camera.Connection?.Model} connected \u00b7 firmware {camera.Connection?.Firmware} \u00b7 captures saved to tablet + card";
+            return camera;
         }
         catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException or System.ComponentModel.Win32Exception)
         {
-            ShowError($"Camera connection failed: {ex.Message}");
             if (cameraActivity.Stage is not (CameraStage.Disconnected or CameraStage.Faulted))
                 UpdateCameraActivity(new(CameraStage.Faulted, "Connection failed \u00b7 see details"));
             status.Text = "Camera not connected \u00b7 timer mode unchanged";
+            throw;
         }
         finally
         {
@@ -522,25 +536,29 @@ public sealed class MainWindow : Window
         }
     }
 
-    private async Task<string?> PickFolderAsync()
+    private async Task<string?> PickFolderAsync(Window? owner = null, TextBlock? pickerError = null)
     {
         var picker = new Windows.Storage.Pickers.FolderPicker();
         picker.FileTypeFilter.Add("*");
-        WinRT.Interop.InitializeWithWindow.Initialize(picker, WinRT.Interop.WindowNative.GetWindowHandle(this));
+        WinRT.Interop.InitializeWithWindow.Initialize(picker, WinRT.Interop.WindowNative.GetWindowHandle(owner ?? this));
         try { return (await picker.PickSingleFolderAsync())?.Path; }
         catch (System.Runtime.InteropServices.COMException ex)
         {
-            ShowError($"Could not open folder picker: {ex.Message}");
+            var message = $"Could not open folder picker: {ex.Message}";
+            if (pickerError is not null) pickerError.Text = message;
+            else ShowError(message);
             return null;
         }
     }
 
-    private void Persist()
+    private void Persist(TextBlock? settingsError = null)
     {
         try { settings.Save(); }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            ShowError($"Could not save settings: {ex.Message}");
+            var message = $"Could not save settings: {ex.Message}";
+            if (settingsError is not null) settingsError.Text = message;
+            else ShowError(message);
         }
     }
 
@@ -608,9 +626,9 @@ public sealed class MainWindow : Window
             if (ReferenceEquals(camera, released))
             {
                 camera = null;
-                UpdateCameraActivity(new(CameraStage.Disconnected, "Camera released by roll workflow; reconnect using Camera."));
+                UpdateCameraActivity(new(CameraStage.Disconnected, "Camera released by roll workflow; reconnect in the open roll or using Camera."));
             }
-        });
+        }, ConnectCameraAsync);
         workflowWindow = child;
         root.IsHitTestVisible = false;
         child.Closed += (_, _) =>

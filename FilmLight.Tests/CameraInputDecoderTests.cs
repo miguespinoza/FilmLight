@@ -45,6 +45,29 @@ public sealed class CameraInputDecoderTests : IDisposable
     }
 
     [Fact]
+    public async Task PictureSamplesDecodeOnlyTheFrameAndSampleOriginsWithoutReferences()
+    {
+        var (roll, frame) = QualifiedRoll();
+        var origin = Capture(CapturePurpose.Frame, Write("picked-frame.tif"), frame.CapturedAt.AddSeconds(-1));
+        roll = roll with { Captures = [frame, origin,
+            Capture(CapturePurpose.LightReference, "obsolete-missing-reference.RAF", frame.CapturedAt.AddSeconds(-2))] };
+        var recipe = new DevelopRecipe
+        {
+            PictureCalibration = new()
+            {
+                Light = new(origin.Id, .1, .2, .8, .7, .6),
+                FilmBase = new(origin.Id, .3, .4, .6, .3, .2)
+            }
+        };
+        var snapshot = await Decoder().DecodeAsync(roll, frame, root, default, recipe);
+        Assert.Equal(frame.Files, snapshot.Captures.Single(c => c.Id == frame.Id).Files);
+        Assert.Equal(origin.Files, snapshot.Captures.Single(c => c.Id == origin.Id).Files);
+        Assert.False(Directory.Exists(Path.Combine(root, "camera-input-cache")));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => Decoder().DecodeAsync(roll, frame, root, default,
+            recipe with { PictureCalibration = new() { Light = new(Guid.NewGuid(), .1, .2, .8, .7, .6) } }));
+    }
+
+    [Fact]
     public async Task DemoQualificationAndProvenanceArePreserved()
     {
         var (roll, frame) = QualifiedRoll(demo: true);
@@ -108,6 +131,22 @@ public sealed class CameraInputDecoderTests : IDisposable
         Assert.False(Directory.Exists(Path.Combine(root, "camera-input-cache")));
     }
 
+    [Theory]
+    [InlineData(CapturePurpose.Frame, "Frame 1")]
+    [InlineData(CapturePurpose.LightReference, "NO-FILM light reference")]
+    [InlineData(CapturePurpose.FilmBaseReference, "FILM BASE reference")]
+    public async Task JpegErrorsIdentifyTheAffectedFrameOrReference(CapturePurpose purpose, string label)
+    {
+        var (roll, frame) = QualifiedRoll();
+        int index = roll.Captures.FindIndex(c => c.Purpose == purpose);
+        roll.Captures[index] = roll.Captures[index] with { Files = [new(LightChannel.White, "camera.JPG")] };
+        frame = roll.Captures.Single(c => c.Purpose == CapturePurpose.Frame);
+        var error = await Assert.ThrowsAsync<InvalidDataException>(() => Decoder().DecodeAsync(roll, frame, root, default));
+        Assert.StartsWith(label + ", White:", error.Message);
+        Assert.Contains("FINE+RAW", error.Message);
+        Assert.False(Directory.Exists(Path.Combine(root, "camera-input-cache")));
+    }
+
     [Fact]
     public async Task PositiveRequiresOnlyLightReferenceAndCancellationDoesNotStartCli()
     {
@@ -143,6 +182,31 @@ public sealed class CameraInputDecoderTests : IDisposable
         float[] expected = [.28318f, .38846f, .57584f];
         for (int i = 0; i < result.Pixels.Length; i++)
             Assert.InRange(Math.Abs(result.Pixels[i] - expected[i % 3]), 0, .0003);
+    }
+
+    [RawFact("FILMLIGHT_TEST_RAF")]
+    public async Task SingleRafCanPreviewWithoutReferenceCapturesOrPicks()
+    {
+        var frame = Capture(CapturePurpose.Frame, Environment.GetEnvironmentVariable("FILMLIGHT_TEST_RAF")!, DateTimeOffset.UtcNow);
+        var roll = new RollDocument { FilmKind = FilmKind.ColorNegative, Captures = [frame] };
+        var progress = new RecordingProcessingProgress();
+        var result = await new DarktableFrameProcessor(Cli).PreviewAsync(roll, frame,
+            new DevelopRecipe { FilmKind = roll.FilmKind, PictureCalibration = new() }, root, progress, default);
+        var stages = progress.Events.Select(p => p.Stage).ToArray();
+        Assert.Contains("Decoding RAW", stages);
+        Assert.Contains("Validating decoded RAW", stages);
+        Assert.Contains("Saving RAW cache", stages);
+        Assert.Contains("Inverting negative", stages);
+        Assert.Equal("Publishing output", stages[^1]);
+        var cachedProgress = new RecordingProcessingProgress();
+        await new CameraInputDecoder(new(Cli)).DecodeAsync(roll, frame, root, default,
+            new DevelopRecipe { FilmKind = roll.FilmKind, PictureCalibration = new() }, cachedProgress);
+        Assert.Contains(cachedProgress.Events, p => p.Stage == "Loading cached RAW");
+        Assert.DoesNotContain(cachedProgress.Events, p => p.Stage == "Decoding RAW");
+        using var image = System.Drawing.Image.FromFile(result.ImagePath);
+        Assert.InRange(Math.Max(image.Width, image.Height), 1, 1600);
+        Assert.True(File.Exists(result.SourceImagePath));
+        Assert.Contains(result.Warnings, w => w.Contains("Provisional"));
     }
 
     [RawFact("FILMLIGHT_TEST_RAF")]

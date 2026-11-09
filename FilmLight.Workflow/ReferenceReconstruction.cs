@@ -10,6 +10,36 @@ internal static class ReferenceReconstruction
     internal static ReconstructedFrame Reconstruct(RollDocument roll, RollCapture frame,
         DevelopRecipe recipe, bool demoOnly, CancellationToken token)
     {
+        ValidateFrame(roll, frame, recipe, demoOnly);
+        if (recipe.PictureCalibration is { } picture)
+        {
+            picture.Validate(roll, frame.Mode);
+            var image = Compose(frame, roll.IsDemo, token);
+            double[] light = picture.Light is { } l ? [l.Red, l.Green, l.Blue] : [1, 1, 1];
+            double[] basis = picture.FilmBase is { } b ? [b.Red, b.Green, b.Blue] : light;
+            double[] adjustments = [recipe.FilmBaseRed, recipe.FilmBaseGreen, recipe.FilmBaseBlue];
+            float[] filmBase = [1, 1, 1];
+            for (int c = 0; c < 3; c++)
+            {
+                if (recipe.FilmKind != FilmKind.Positive)
+                {
+                    filmBase[c] = (float)(basis[c] / light[c] * adjustments[c]);
+                    if (filmBase[c] is < .00001f or > 1.5f)
+                        throw new InvalidDataException("Picked film must transmit less light than the exposed backlight. Pick clear/unexposed film and bare light, not image content.");
+                }
+            }
+            for (int i = 0; i < image.Pixels.Length; i++)
+            {
+                if ((i & 65535) == 0) token.ThrowIfCancellationRequested();
+                image.Pixels[i] /= (float)light[i % 3];
+            }
+            return new(image, filmBase);
+        }
+        return ReconstructReferences(roll, frame, recipe, token);
+    }
+
+    private static void ValidateFrame(RollDocument roll, RollCapture frame, DevelopRecipe recipe, bool demoOnly)
+    {
         ValidateRecipe(recipe);
         if (frame.Purpose != CapturePurpose.Frame || !roll.Captures.Any(c => c.Id == frame.Id))
             throw new InvalidOperationException("The selected frame must belong to this roll.");
@@ -19,6 +49,11 @@ internal static class ReferenceReconstruction
             throw new InvalidOperationException("DemoFrameProcessor only accepts explicitly synthetic rolls and captures. Select DarktableFrameProcessor for real input.");
         if (frame.IsDemo != roll.IsDemo)
             throw new InvalidOperationException("Real and synthetic captures cannot be mixed.");
+    }
+
+    private static ReconstructedFrame ReconstructReferences(RollDocument roll, RollCapture frame,
+        DevelopRecipe recipe, CancellationToken token)
+    {
         var light = Reference(roll, frame, CapturePurpose.LightReference);
         var basis = recipe.FilmKind == FilmKind.Positive ? null : Reference(roll, frame, CapturePurpose.FilmBaseReference);
         var normalized = Normalize(frame, light, recipe, roll.IsDemo, token);
@@ -45,6 +80,28 @@ internal static class ReferenceReconstruction
             }
         }
         return new(normalized, filmBase);
+    }
+
+    private static LinearImage Compose(RollCapture capture, bool synthetic, CancellationToken token)
+    {
+        LightChannel[] channels = capture.Mode == CaptureMode.White ? [LightChannel.White] :
+            [LightChannel.Red, LightChannel.Green, LightChannel.Blue];
+        ValidateFiles(capture, channels);
+        LinearImage? result = null;
+        foreach (var channel in channels)
+        {
+            var source = Read(capture.Files.Single(f => f.Channel == channel).Path, synthetic, token);
+            if (capture.Mode == CaptureMode.White) return source;
+            result ??= new(source.Width, source.Height, new float[source.Pixels.Length]);
+            Match(result, source);
+            int selected = channel switch { LightChannel.Red => 0, LightChannel.Green => 1, _ => 2 };
+            for (int i = selected; i < source.Pixels.Length; i += 3)
+            {
+                if ((i & 65535) < 3) token.ThrowIfCancellationRequested();
+                result.Pixels[i] = source.Pixels[i];
+            }
+        }
+        return result ?? throw new InvalidDataException("Capture has no channels.");
     }
 
     private static RollCapture Reference(RollDocument roll, RollCapture frame, CapturePurpose purpose) =>
@@ -89,7 +146,7 @@ internal static class ReferenceReconstruction
     {
         if (!Path.GetExtension(path).Equals(".tif", StringComparison.OrdinalIgnoreCase) &&
             !Path.GetExtension(path).Equals(".tiff", StringComparison.OrdinalIgnoreCase))
-            throw new NotSupportedException("Linear reconstruction currently requires qualified linear RGB TIFFs. RAF decoding/black levels/exposure metadata are not implemented; X-T5 lossy RAF is unsupported. Do not substitute camera JPEGs.");
+            throw new NotSupportedException("Linear reconstruction requires qualified linear RGB TIFFs. Decode camera RAF input first; camera JPEGs cannot substitute for linear RAW.");
         using (var tif = Tiff.Open(path, "r") ?? throw new InvalidDataException($"Cannot decode {path}"))
             if ((tif.GetField(TiffTag.IMAGEDESCRIPTION)?[0].ToString() ?? "").Contains(
                     ProcessingImages.SyntheticLabel, StringComparison.Ordinal) != synthetic)
@@ -107,12 +164,51 @@ internal static class ReferenceReconstruction
     private static void Match(LinearImage a, LinearImage b)
     {
         if (a.Width != b.Width || a.Height != b.Height)
-            throw new InvalidDataException("Frame and references must have identical dimensions and registration.");
+            throw new InvalidDataException("Frame channels and any reference images must have identical dimensions and registration.");
+    }
+
+    internal static DevelopRecipe AutoSample(RollDocument roll, RollCapture frame, DevelopRecipe recipe,
+        CancellationToken token)
+    {
+        ValidateFrame(roll, frame, recipe, roll.IsDemo);
+        var picture = SprocketCalibration.Detect(Compose(frame, roll.IsDemo, token), frame.Id,
+            recipe.FilmKind != FilmKind.Positive, token);
+        return recipe with { PictureCalibration = picture, Accepted = false, AcceptedAt = null };
     }
 
     internal static DevelopRecipe Sample(RollDocument roll, RollCapture frame, DevelopRecipe recipe,
         CalibrationTarget target, double x, double y, CancellationToken token)
     {
+        if (recipe.PictureCalibration is { } picture)
+        {
+            ValidateFrame(roll, frame, recipe, roll.IsDemo);
+            picture.Validate(roll, frame.Mode);
+            var image = Compose(frame, roll.IsDemo, token);
+            var (sx, sy, sw, sh) = Crop(image, recipe);
+            int sampleX = sx + (int)(x * sw), sampleY = sy + (int)(y * sh);
+            double[] sums = [0, 0, 0];
+            int count = 0;
+            for (int y0 = Math.Max(sy, sampleY - 2); y0 <= Math.Min(sy + sh - 1, sampleY + 2); y0++)
+            for (int x0 = Math.Max(sx, sampleX - 2); x0 <= Math.Min(sx + sw - 1, sampleX + 2); x0++)
+            {
+                token.ThrowIfCancellationRequested();
+                for (int c = 0; c < 3; c++)
+                {
+                    float value = image.Pixels[(y0 * image.Width + x0) * 3 + c];
+                    if (value <= .0001f || value >= .99999f)
+                        throw new InvalidDataException("The selected patch is dark or clipped. Pick evenly lit backlight / clear film away from edges.");
+                    sums[c] += value;
+                }
+                count++;
+            }
+            var sample = new PictureSample(frame.Id, x, y, sums[0] / count, sums[1] / count, sums[2] / count);
+            sample.Validate();
+            return recipe with
+            {
+                PictureCalibration = target == CalibrationTarget.Backlight ? picture with { Light = sample } : picture with { FilmBase = sample },
+                Accepted = false, AcceptedAt = null
+            };
+        }
         var baseline = Reconstruct(roll, frame, recipe with
         {
             FilmBaseRed = 1, FilmBaseGreen = 1, FilmBaseBlue = 1
@@ -164,6 +260,8 @@ internal static class ReferenceReconstruction
 
     internal static void ValidateRecipe(DevelopRecipe r)
     {
+        r.PictureCalibration?.Light?.Validate();
+        r.PictureCalibration?.FilmBase?.Validate();
         if (!Enum.IsDefined(r.FilmKind) || r.Revision < 1 ||
             !double.IsFinite(r.ExposureEv) || Math.Abs(r.ExposureEv) > 16 ||
             new[] { r.RedGain, r.GreenGain, r.BlueGain, r.FilmBaseRed, r.FilmBaseGreen, r.FilmBaseBlue }

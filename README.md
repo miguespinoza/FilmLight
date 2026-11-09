@@ -83,7 +83,8 @@ hardware acceptance gates.
 
 ## Roll workflow
 
-Open **Roll workflow** after connecting a camera, or explicitly select **Demo camera**
+Open **Roll workflow** and use **Connect USB camera** there, connect in the main
+window first, or explicitly select **Demo camera**
 to try the entire workflow without hardware. Demo windows, files, previews and
 exports stay labelled **DEMO / SYNTHETIC**; the synthetic renderer is never a fallback
 for real captures.
@@ -99,37 +100,73 @@ For an older roll outside the library, paste its full folder path under
 remembers it without moving its files. Metadata stays in each roll's `roll.json`,
 with linked folder paths in `Pictures\FilmLight\Rolls\linked-rolls.json`; no database is required.
 The capture mode is fixed after the
-first reference; use separate rolls for different modes.
+first picture; use separate rolls for different modes. There is no separate
+calibration or reference-photo step.
 
-1. **References:** capture **NO-FILM** illumination, then a **FILM BASE** reference
-   using clear/unexposed developed film. Positive/reversal film needs no film-base
-   reference. RGB references contain three separate exposures. Keep camera exposure,
-   white balance, focus, display brightness, geometry and lighting fixed.
-2. **Capture:** advance/focus the film and capture numbered frames. White is one
+If the camera needs to be released, confirm it is physically idle using the
+checkbox, then **Confirm idle / release camera**. Use **Connect USB camera** in
+the same roll window to reconnect; there is no need to close the workflow.
+This also works after a camera fault once idle is confirmed. Captures, numbering,
+preview, picture picks and recipe edits stay in the open roll. Reconnection keeps
+the current phase and reuses the saved light/film picks; keep physical camera
+exposure, white balance, focus, display brightness, geometry and lighting fixed.
+Canceling or failing a connection leaves the roll open for retry. Camera controls
+are disabled during exposures, downloads, processing and connection setup.
+
+1. **Capture:** capture a picture with exposed backlight and clear/unexposed film
+   visible around the image. White is one
    exposure; RGB is one complete triplet. RAW+JPEG partners remain grouped together.
    Each complete frame is saved first, then automatically rendered as a positive
-   on the right, without leaving Capture. Previews are limited to 1600 pixels on
+   on the right, without leaving Capture. The initial preview is provisional.
+   Click **Pick backlight WB**, then click exposed light with no film over it.
+   Click **Pick film base**, then click clear/unexposed developed film, not image
+   content or the holder. Each picker switches to the negative/source view;
+   **Show negative** also lets you inspect it manually. Positive/reversal film
+   needs only the light pick.
+   Picks average a 5 x 5 patch from the full-resolution linear input, not the
+   displayed JPEG. Once the required picks produce a successful preview, they
+   are automatically applied to the entire roll: existing and future frames,
+   previews and exports. They remain saved after reopening or reconnecting;
+   no per-frame picking is required. **Reset picks** clears the current draft's
+   samples so you can render and pick again if the setup changes. Previous
+   accepted revisions and outputs remain intact.
+   **Auto-pick light + base** is an alternative to manual picking: it looks for
+   at least three evenly spaced sprocket holes near an edge of the
+   uncropped RAW, with the film strip roughly horizontal or vertical. It measures
+   robust median RGB in the hole interiors (bare backlight) and in clear film
+   between adjacent holes, avoiding their edges. Detection uses a reduced-size
+   linear image; color measurements use the full-resolution linear input, never
+   screenshot/JPEG colors. No neural network or additional runtime is required.
+   Clipped, nonuniform or conflicting measurements are rejected without changing
+   existing picks; use manual picking when perforations are absent, obscured or
+   substantially rotated. Automatic picks remain an **unaccepted draft** until
+   you inspect and accept their positive preview. Crop and other develop controls
+   are preserved; the saved samples can be reused across the roll. Positive film
+   uses only the backlight sample. Partially cropped holes are supported when
+   enough of their interiors remain visible. Geometric localization has been
+   demonstrated on real RAF previews; RAW color accuracy still needs qualification.
+   Previews are limited to 1600 pixels on
    the long edge; exports retain full cropped resolution. RAW decoding still takes
    time, especially on the first frame. If previewing fails or is canceled, the
    saved capture stays in the roll: use **Render Preview**, not another exposure.
+   While work runs, the preview area shows an animated activity ring, the current
+   stage (RAW decode/cache, negative inversion, TIFF/JPEG encoding or loading),
+   and total/stage elapsed time. The frame is explicitly marked as saved before
+   conversion starts. No guessed percentage or remaining time is shown;
+   **Pause / cancel safely** remains available. The indicator clears on completion,
+   cancellation or error, leaving the result/error in the status area.
+   The frame selector includes its saved file format. Switching the camera to RAW
+   does not change older JPEG frames; capture a new RAW
+   frame in **1. Capture**. JPEG-only previews show an actionable error instead
+   of leaving the status on Processing.
    Illumination stays on the left through every phase; its size and color cannot
-   change during an unfinished exposure/download. Reopening a real camera lease
-   requires fresh references before adding captures.
-3. **Develop:** use **Pick backlight WB** to click exposed illumination with no film,
-   or **Pick film base** to click clear/unexposed developed film. Each picker switches
-   to the negative/source view; **Show negative** also lets you inspect it manually.
-   Picks average a 5 x 5 patch of the underlying reference-normalized linear input,
-   not the displayed JPEG. Backlight sampling replaces positive-output channel gains
-   to correct residual tint after light-reference normalization; film-base sampling
-   replaces measured-base multipliers. Both are saved as unaccepted recipe revisions
-   and automatically re-render the positive. These roll-wide settings do not replace
-   the required reference captures or change camera white balance.
-   In **Develop settings**, adjust rendering exposure, channel
+   change during an unfinished exposure/download.
+2. **Develop (optional):** in **Develop settings**, adjust rendering exposure, channel
    gains, measured film-base multipliers, black/white levels and crop, then
-   **Render Preview**. Crop out dark film-holder borders before measuring the base.
+   **Render Preview**. Pick light and film before cropping them out of the picture.
    **Accept this preview** saves an immutable recipe revision; editing any setting
    requires another preview. These controls do not change camera exposure.
-4. **Export:** process missing/failed frames using the identified accepted revision.
+3. **Export:** process missing/failed frames using the identified accepted revision.
    A successful export is a validated 16-bit TIFF master and JPEG companion.
    Pause/cancel retains inputs and diagnostic artifacts. Missing outputs can be
    regenerated without overwriting existing files.
@@ -146,7 +183,9 @@ Roll manifests currently use absolute paths: keep the roll at its original locat
 when resuming it.
 
 Recipes currently apply to the whole roll; per-frame overrides are not implemented.
-Original captures and references are never deleted automatically. A rendered TIFF
+Older accepted reference-based recipes remain usable for existing exports; new
+edits use picture picks. Original captures and legacy references are never deleted
+automatically. A rendered TIFF
 is not reversible RAW and cannot replace retained captures for future reinversion.
 
 ### Real image processing
@@ -161,7 +200,8 @@ JPEG-only and lossy-compressed RAF inputs are rejected rather than processed as 
 they were linear RAW. The decoder uses CFA black/white correction, demosaicing and
 the camera's standard input matrix, with fixed unity processing white balance and
 no automatic exposure or tone mapping. Camera settings are never changed. It checks
-matching camera/exposure metadata across the selected frame and its references.
+matching camera/exposure metadata across the selected frame and the picture(s)
+from which the roll's light and film were picked.
 
 Signed scene-linear values from sensor noise/profile matrices are preserved in
 32-bit intermediates; negadoctor applies its density-domain floor, rather than the
@@ -182,11 +222,35 @@ module order, and no other enabled history modules. Ordinary full RAW-developmen
 XMPs are not interchangeable with this normalized-linear-input template. Film Light
 owns input normalization, exposure, levels, gains and crop.
 
-Sequential RGB reconstruction divides each selected primary channel by its matching
-no-film reference **before** inversion; it does not HDR-average or independently
-invert the three images. It assumes fixed exposure and registration. Spectral
+Sequential RGB reconstruction divides each selected primary channel by the matching
+component of the picked light **before** inversion; film-base transmission comes
+from the picked clear-film patch. It does not HDR-average or independently
+invert the three images. Point picks provide global normalization, not spatial
+flatfield correction. It assumes fixed exposure and registration. Spectral
 crosstalk, physical alignment, film color accuracy and real X-T5 operation still
 require hardware qualification; synthetic validation does not certify them.
+
+## Sprocket annotation demo
+
+On Windows with the .NET 10 SDK:
+
+```powershell
+.\tools\DemoSprocketCalibration.ps1 -InputDirectory 'C:\scans\roll' -OutputDirectory '.\artifacts\SprocketDemo'
+```
+
+This runs the shared sprocket geometry detector on each RAF's embedded JPEG
+(or a supplied JPEG/PNG/TIFF), without changing originals or their sidecars.
+It writes annotated PNGs (up to 1800 pixels on the long edge), a thumbnail
+`index.html` gallery, and `report.json` with normalized coordinates and failures.
+**Red** marks bare light inside a hole; **blue** marks film between holes.
+Missing or unreliable sprocket pairs, including blank-light references with no
+film visible, receive a warning rather than fabricated dots. The script analyzes
+the selected folder only, not its subfolders.
+
+This is a **location/geometry demonstration**, not color calibration: preview
+clipping is allowed for locating holes, but the normal RAW calibration path still
+rejects clipped color samples. Do not feed JPEG colors into negadoctor. No network
+service or darktable installation is required for this visual demo.
 
 ## Build and run
 
@@ -219,15 +283,27 @@ With the camera disconnected, `-ProbeCamera` also exercises actual SDK startup a
 the no-camera error path. `-SkipPixels` explicitly disables screen-pixel checks when
 the desktop is unavailable to GDI; UI Automation checks still run.
 
-The four-phase native workflow smoke check uses an explicitly synthetic camera,
-exercises preview invalidation/acceptance, TIFF/JPEG export, missing-output retry,
+The three-phase native workflow smoke check uses an explicitly synthetic camera,
+exercises reference-free capture, mouse picks reused on later frames and reopen,
+preview invalidation/acceptance, TIFF/JPEG export, missing-output retry,
 automatic folder creation and the metadata-rich resume dialog. It leaves its demo
-roll under `Pictures\FilmLight\Rolls`:
+roll under `Pictures\FilmLight\Rolls`; diagnostic fixtures stay under `artifacts`:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\WorkflowSmokeTest.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\WorkflowSmokeTest.ps1 -CaptureMode Rgb
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\WorkflowSmokeTest.ps1 -ProbePreviewErrors
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\WorkflowSmokeTest.ps1 -ProbeReconnect
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\WorkflowSmokeTest.ps1 -ProbeProgress -RawPath 'C:\Scans\frame.RAF'
 ```
+
+The preview-error probe uses generated JPEG-only test inputs, requires darktable at
+its standard installation path, and never connects to the camera.
+The progress probe copies the supplied supported RAW into an isolated fixture and
+checks visible conversion stages, a live elapsed timer, completion and cancellation.
+It requires darktable at its standard path and never connects to the camera.
+The reconnect probe checks setup cancellation/retry with a saved roll open and
+does not touch camera hardware; physical reconnect still needs hardware acceptance.
 
 Processing tests execute actual negadoctor when darktable 5.6.2 is installed at
 `C:\Program Files\darktable\bin\darktable-cli.exe`, or when
