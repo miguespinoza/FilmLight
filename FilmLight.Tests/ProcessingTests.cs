@@ -102,6 +102,102 @@ public sealed class ProcessingTests : IDisposable
     }
 
     [Fact]
+    public void PreviewPointMappingRejectsLetterboxesAndMapsScaledImageCoordinates()
+    {
+        Assert.False(FrameCalibration.TryMapPoint(800, 600, 400, 200, 400, 50, out _, out _));
+        Assert.True(FrameCalibration.TryMapPoint(800, 600, 400, 200, 200, 200, out var x, out var y));
+        Assert.Equal(.25, x);
+        Assert.Equal(.25, y);
+        Assert.False(FrameCalibration.TryMapPoint(600, 800, 200, 400, 50, 400, out _, out _));
+        Assert.True(FrameCalibration.TryMapPoint(600, 800, 200, 400, 300, 400, out x, out y));
+        Assert.Equal(.5, x);
+        Assert.Equal(.5, y);
+        Assert.False(FrameCalibration.TryMapPoint(0, 600, 400, 200, 0, 0, out _, out _));
+        Assert.False(FrameCalibration.TryMapPoint(800, 600, 400, 200, 800, 300, out _, out _));
+    }
+
+    [Theory]
+    [InlineData(CaptureMode.White)]
+    [InlineData(CaptureMode.Rgb)]
+    public async Task BacklightPickerUsesLinearSourceChannelsRatherThanPositiveJpeg(CaptureMode mode)
+    {
+        var (roll, frame, recipe) = await Roll(mode);
+        foreach (var file in frame.Files)
+        {
+            var image = ProcessingImages.ReadLinear(file.Path, default, true);
+            var light = ProcessingImages.ReadLinear(roll.Captures.Single(c => c.Purpose == CapturePurpose.LightReference)
+                .Files.Single(f => f.Channel == file.Channel).Path, default, true);
+            for (int i = 0; i < image.Pixels.Length; i += 3)
+            {
+                image.Pixels[i] = light.Pixels[i] * .2f;
+                image.Pixels[i + 1] = light.Pixels[i + 1] * .3f;
+                image.Pixels[i + 2] = light.Pixels[i + 2] * .1f;
+            }
+            ProcessingImages.WriteTiff(file.Path, image, true,
+                ProcessingImages.SyntheticLabel + "; " + ProcessingImages.LinearLabel, default,
+                ProcessingImages.LinearRec2020Profile());
+        }
+        var changed = await FrameCalibration.SampleAsync(roll, frame, recipe,
+            CalibrationTarget.Backlight, .5, .5, root, null, default);
+        Assert.Equal(1.5, changed.RedGain, 5);
+        Assert.Equal(1, changed.GreenGain);
+        Assert.Equal(3, changed.BlueGain, 5);
+        Assert.False(changed.Accepted);
+        Assert.Equal(recipe.FilmBaseRed, changed.FilmBaseRed);
+    }
+
+    [Theory]
+    [InlineData(CaptureMode.White)]
+    [InlineData(CaptureMode.Rgb)]
+    public async Task FilmBasePickerMapsCropAndReplacesPreviousMultipliersWithoutCompounding(CaptureMode mode)
+    {
+        var (roll, frame, recipe) = await Roll(mode);
+        recipe = recipe with { CropLeft = .1, CropRight = .1, CropTop = .1, CropBottom = .1,
+            FilmBaseRed = 1.3, FilmBaseGreen = .8, FilmBaseBlue = 1.2 };
+        var changed = await FrameCalibration.SampleAsync(roll, frame, recipe,
+            CalibrationTarget.FilmBase, .3, .4, root, null, default);
+        var reconstruction = ReferenceReconstruction.Reconstruct(roll, frame, changed, true, default);
+        var (left, top, width, height) = ReferenceReconstruction.Crop(reconstruction.Image, recipe);
+        int px = left + (int)(.3 * width), py = top + (int)(.4 * height);
+        for (int c = 0; c < 3; c++)
+        {
+            double average = 0;
+            for (int y = py - 2; y <= py + 2; y++)
+            for (int x = px - 2; x <= px + 2; x++)
+                average += reconstruction.Image.Pixels[(y * reconstruction.Image.Width + x) * 3 + c] / 25;
+            Assert.Equal(average, reconstruction.FilmBase[c], 5);
+        }
+        var repeated = await FrameCalibration.SampleAsync(roll, frame, changed,
+            CalibrationTarget.FilmBase, .3, .4, root, null, default);
+        Assert.Equal(changed, repeated);
+        Assert.False(changed.Accepted);
+        Assert.Equal(recipe.RedGain, changed.RedGain);
+    }
+
+    [Fact]
+    public async Task PickerRejectsInvalidPointsClippedPatchesAndCancellation()
+    {
+        var (roll, frame, recipe) = await Roll(CaptureMode.White);
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => FrameCalibration.SampleAsync(
+            roll, frame, recipe, CalibrationTarget.FilmBase, double.NaN, .5, root, null, default));
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => FrameCalibration.SampleAsync(
+            roll, frame, recipe, CalibrationTarget.FilmBase, 1, .5, root, null, default));
+        using var cancel = new CancellationTokenSource();
+        cancel.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => FrameCalibration.SampleAsync(
+            roll, frame, recipe, CalibrationTarget.Backlight, .5, .5, root, null, cancel.Token));
+        var path = frame.Files[0].Path;
+        var image = ProcessingImages.ReadLinear(path, default, true);
+        for (int y = 124; y <= 132; y++)
+        for (int x = 188; x <= 196; x++)
+            image.Pixels[(y * image.Width + x) * 3] = 0;
+        ProcessingImages.WriteTiff(path, image, true, ProcessingImages.SyntheticLabel + "; " + ProcessingImages.LinearLabel,
+            default, ProcessingImages.LinearRec2020Profile());
+        await Assert.ThrowsAsync<InvalidDataException>(() => FrameCalibration.SampleAsync(
+            roll, frame, recipe, CalibrationTarget.Backlight, .5, .5, root, null, default));
+    }
+
+    [Fact]
     public async Task PreviewAndExportUseSameRecipeAndValidateJpegAnd16BitRgbTiff()
     {
         var (roll, frame, recipe) = await Roll(CaptureMode.White);
@@ -114,6 +210,11 @@ public sealed class ProcessingTests : IDisposable
         Assert.Contains(preview.Warnings, w => w.Contains("SYNTHETIC"));
         Assert.Contains("SYNTHETIC", preview.ImagePath);
         using var jpeg = Image.FromFile(preview.ImagePath);
+        Assert.NotNull(preview.SourceImagePath);
+        using var source = Image.FromFile(preview.SourceImagePath);
+        Assert.Equal(jpeg.Width, source.Width);
+        Assert.Equal(jpeg.Height, source.Height);
+        Assert.NotEqual(File.ReadAllBytes(preview.ImagePath), File.ReadAllBytes(preview.SourceImagePath));
         Assert.Equal(346, jpeg.Width);
         Assert.Equal(205, jpeg.Height);
         Assert.Equal(File.ReadAllBytes(preview.ImagePath), File.ReadAllBytes(export.OutputFiles[1]));
@@ -254,6 +355,42 @@ public sealed class ProcessingTests : IDisposable
             Assert.EndsWith(".partial", directory);
             Assert.True(File.Exists(Path.Combine(directory, "version.stderr.log")));
         });
+    }
+
+    [Fact]
+    public Task CapturePreviewsAreBoundedWhileExportsKeepFullCroppedResolution() =>
+        AssertBoundedPreview(new DemoFrameProcessor());
+
+    [InstalledDarktableFact]
+    public Task DarktableCapturePreviewsAreBoundedWhileExportsKeepFullCroppedResolution() =>
+        AssertBoundedPreview(new DarktableFrameProcessor(Cli));
+
+    private async Task AssertBoundedPreview(IFrameProcessor processor)
+    {
+        var (roll, frame, recipe) = await Roll(CaptureMode.White);
+        foreach (var capture in roll.Captures)
+        {
+            var path = capture.Files[0].Path;
+            var source = ProcessingImages.ReadLinear(path, default, true);
+            var large = new LinearImage(2200, 100, new float[2200 * 100 * 3]);
+            for (int y = 0; y < large.Height; y++)
+            for (int x = 0; x < large.Width; x++)
+                Array.Copy(source.Pixels, (y * source.Width + x % source.Width) * 3,
+                    large.Pixels, (y * large.Width + x) * 3, 3);
+            ProcessingImages.WriteTiff(path, large, true, ProcessingImages.SyntheticLabel + "; " + ProcessingImages.LinearLabel,
+                default, ProcessingImages.LinearRec2020Profile());
+        }
+        recipe = recipe with { CropLeft = .1, CropRight = .1, CropTop = .1, CropBottom = .1 };
+        var preview = await processor.PreviewAsync(roll, frame, recipe, root, null, default);
+        using var image = Image.FromFile(preview.ImagePath);
+        using var sourcePreview = Image.FromFile(preview.SourceImagePath!);
+        Assert.Equal(1600, image.Width);
+        Assert.Equal(72, image.Height);
+        Assert.Equal(image.Size, sourcePreview.Size);
+        var export = await processor.ExportAsync(roll, frame, recipe, root, null, default);
+        using var full = Image.FromFile(export.OutputFiles[1]);
+        Assert.Equal(1760, full.Width);
+        Assert.Equal(80, full.Height);
     }
 
     [InstalledDarktableFact]

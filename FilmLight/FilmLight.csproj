@@ -21,4 +21,15 @@
     <ProjectReference Include="..\FilmLight.Fujifilm\FilmLight.Fujifilm.csproj" />
     <ProjectReference Include="..\FilmLight.Workflow\FilmLight.Workflow.csproj" />
   </ItemGroup>
+  <!-- Unpackaged publishing omits the merged PRI needed by WinUI control templates. -->
+  <Target Name="PublishAppResourcePri" BeforeTargets="ComputeResolvedFilesToPublishList">
+    <Error Condition="'$(ProjectPriFullPath)' == '' Or !Exists('$(ProjectPriFullPath)')"
+           Text="The app resource index was not generated; publishing without it would crash WinUI controls." />
+    <ItemGroup>
+      <ResolvedFileToPublish Include="$(ProjectPriFullPath)">
+        <RelativePath>$(AssemblyName).pri</RelativePath>
+        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      </ResolvedFileToPublish>
+    </ItemGroup>
+  </Target>
 </Project>

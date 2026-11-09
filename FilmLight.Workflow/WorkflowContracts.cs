@@ -54,7 +54,7 @@ public sealed record RollDocument
 }
 
 public sealed record ProcessingProgress(Guid? FrameId, string Stage, string Message, int Completed = 0, int Total = 0);
-public sealed record PreviewResult(string ImagePath, IReadOnlyList<string> Warnings);
+public sealed record PreviewResult(string ImagePath, IReadOnlyList<string> Warnings, string? SourceImagePath = null);
 public sealed record FrameProcessingResult(IReadOnlyList<string> OutputFiles, IReadOnlyList<string> Warnings);
 
 public interface IFrameProcessor

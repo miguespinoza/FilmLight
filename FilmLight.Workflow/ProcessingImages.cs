@@ -100,6 +100,41 @@ internal static class ProcessingImages
             throw new InvalidDataException("TIFF dimensions do not match the recipe crop.");
     }
 
+    internal static LinearImage CropForPreview(LinearImage image, DevelopRecipe recipe, CancellationToken token)
+    {
+        var (left, top, width, height) = ReferenceReconstruction.Crop(image, recipe);
+        double scale = Math.Min(1, 1600.0 / Math.Max(width, height));
+        int w = Math.Max(1, (int)(width * scale)), h = Math.Max(1, (int)(height * scale));
+        var small = new LinearImage(w, h, new float[w * h * 3]);
+        for (int y = 0; y < h; y++)
+        {
+            token.ThrowIfCancellationRequested();
+            for (int x = 0; x < w; x++)
+            {
+                int i = ((top + Math.Min(height - 1, (int)(y / scale))) * image.Width
+                    + left + Math.Min(width - 1, (int)(x / scale))) * 3;
+                Array.Copy(image.Pixels, i, small.Pixels, (y * w + x) * 3, 3);
+            }
+        }
+        return small;
+    }
+
+    [SupportedOSPlatform("windows")]
+    internal static void WriteSourcePreview(string path, LinearImage image, DevelopRecipe recipe, CancellationToken token)
+    {
+        var small = CropForPreview(image, recipe, token);
+        for (int i = 0; i < small.Pixels.Length; i += 3)
+        {
+            if ((i & 65535) == 0) token.ThrowIfCancellationRequested();
+            float r = small.Pixels[i], g = small.Pixels[i + 1], b = small.Pixels[i + 2];
+            // Linear Rec2020 to linear sRGB; this view is for locating source patches.
+            small.Pixels[i] = 1.660491f * r - .587641f * g - .072850f * b;
+            small.Pixels[i + 1] = -.124550f * r + 1.132900f * g - .008349f * b;
+            small.Pixels[i + 2] = -.018151f * r - .100579f * g + 1.118730f * b;
+        }
+        WriteJpeg(path, small, token);
+    }
+
     [SupportedOSPlatform("windows")]
     internal static void WriteJpeg(string path, LinearImage image, CancellationToken token)
     {

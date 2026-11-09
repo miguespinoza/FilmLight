@@ -60,6 +60,7 @@ public sealed class DemoCaptureSource : IWorkflowCaptureSource
                 if (purpose != CapturePurpose.LightReference)
                 {
                     transmission = filmBase[c];
+                    if (purpose == CapturePurpose.Frame && x < 8) transmission = 1;
                     if (purpose == CapturePurpose.Frame && x > 18 && x < width - 19 && y > 18 && y < height - 19)
                     {
                         double scene = .12 + .72 * ((x + number * 17 + c * 53) % (width - 38)) / (width - 38);

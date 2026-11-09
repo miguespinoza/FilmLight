@@ -110,6 +110,58 @@ internal static class ReferenceReconstruction
             throw new InvalidDataException("Frame and references must have identical dimensions and registration.");
     }
 
+    internal static DevelopRecipe Sample(RollDocument roll, RollCapture frame, DevelopRecipe recipe,
+        CalibrationTarget target, double x, double y, CancellationToken token)
+    {
+        var baseline = Reconstruct(roll, frame, recipe with
+        {
+            FilmBaseRed = 1, FilmBaseGreen = 1, FilmBaseBlue = 1
+        }, roll.IsDemo, token);
+        var (left, top, width, height) = Crop(baseline.Image, recipe);
+        int px = left + (int)(x * width), py = top + (int)(y * height);
+        var values = Average(baseline.Image);
+        if (target == CalibrationTarget.Backlight)
+        {
+            // Correct residual tint after light-reference normalization, not the illuminant twice.
+            return Checked(recipe with
+            {
+                RedGain = values[1] / values[0], GreenGain = 1, BlueGain = values[1] / values[2]
+            });
+        }
+        return Checked(recipe with
+        {
+            FilmBaseRed = values[0] / baseline.FilmBase[0],
+            FilmBaseGreen = values[1] / baseline.FilmBase[1],
+            FilmBaseBlue = values[2] / baseline.FilmBase[2]
+        });
+
+        DevelopRecipe Checked(DevelopRecipe changed)
+        {
+            ValidateRecipe(changed);
+            return changed with { Accepted = false, AcceptedAt = null };
+        }
+
+        double[] Average(LinearImage image)
+        {
+            double[] sum = [0, 0, 0];
+            int count = 0;
+            for (int sy = Math.Max(top, py - 2); sy <= Math.Min(top + height - 1, py + 2); sy++)
+            for (int sx = Math.Max(left, px - 2); sx <= Math.Min(left + width - 1, px + 2); sx++)
+            {
+                token.ThrowIfCancellationRequested();
+                for (int c = 0; c < 3; c++)
+                {
+                    float value = image.Pixels[(sy * image.Width + sx) * 3 + c];
+                    if (!float.IsFinite(value) || value <= .0001f || value > 1.5f)
+                        throw new InvalidDataException("The selected patch is dark or clipped. Pick evenly lit backlight / clear film away from edges, or recapture.");
+                    sum[c] += value;
+                }
+                count++;
+            }
+            return sum.Select(v => v / count).ToArray();
+        }
+    }
+
     internal static void ValidateRecipe(DevelopRecipe r)
     {
         if (!Enum.IsDefined(r.FilmKind) || r.Revision < 1 ||
@@ -143,7 +195,7 @@ internal static class ReferenceReconstruction
         return output;
     }
 
-    private static (int Left, int Top, int Width, int Height) Crop(LinearImage source, DevelopRecipe recipe)
+    internal static (int Left, int Top, int Width, int Height) Crop(LinearImage source, DevelopRecipe recipe)
     {
         int left = (int)Math.Floor(source.Width * recipe.CropLeft);
         int top = (int)Math.Floor(source.Height * recipe.CropTop);

@@ -27,8 +27,9 @@ public sealed class DarktableFrameProcessor : IFrameProcessor
     public async Task<PreviewResult> PreviewAsync(RollDocument roll, RollCapture frame, DevelopRecipe recipe,
         string workDirectory, IProgress<ProcessingProgress>? progress, CancellationToken cancellationToken)
     {
-        var result = await ProcessAsync(roll, frame, recipe, workDirectory, progress, cancellationToken).ConfigureAwait(false);
-        return new(result.OutputFiles[1], result.Warnings);
+        var result = await ProcessAsync(roll, frame, recipe, workDirectory, progress, cancellationToken, true).ConfigureAwait(false);
+        return new(result.OutputFiles[1], result.Warnings,
+            Path.Combine(Path.GetDirectoryName(result.OutputFiles[1])!, "source-preview.jpg"));
     }
 
     public Task<FrameProcessingResult> ExportAsync(RollDocument roll, RollCapture frame, DevelopRecipe recipe,
@@ -36,7 +37,7 @@ public sealed class DarktableFrameProcessor : IFrameProcessor
         ProcessAsync(roll, frame, recipe, outputDirectory, progress, cancellationToken);
 
     private Task<FrameProcessingResult> ProcessAsync(RollDocument roll, RollCapture frame, DevelopRecipe recipe,
-        string directory, IProgress<ProcessingProgress>? progress, CancellationToken token)
+        string directory, IProgress<ProcessingProgress>? progress, CancellationToken token, bool forPreview = false)
     {
         var warnings = new List<string>
         {
@@ -59,6 +60,13 @@ public sealed class DarktableFrameProcessor : IFrameProcessor
                 var decodedFrame = decoded.Captures.Single(c => c.Id == frame.Id);
                 var reconstruction = await Task.Run(() =>
                     ReferenceReconstruction.Reconstruct(decoded, decodedFrame, recipe, false, token), token).ConfigureAwait(false);
+                var controls = recipe;
+                if (forPreview)
+                {
+                    reconstruction = reconstruction with { Image = ProcessingImages.CropForPreview(reconstruction.Image, recipe, token) };
+                    controls = recipe with { CropLeft = 0, CropTop = 0, CropRight = 0, CropBottom = 0 };
+                    ProcessingImages.WriteSourcePreview(Path.Combine(staging, "source-preview.jpg"), reconstruction.Image, controls, token);
+                }
                 if (recipe.FilmKind == FilmKind.BlackAndWhiteNegative)
                 {
                     // Normalize substrate color before monochrome inversion; negadoctor's B&W mode
@@ -87,7 +95,7 @@ public sealed class DarktableFrameProcessor : IFrameProcessor
                 var image = ProcessingImages.ReadLinear(rendered, token);
                 if (image.Width != reconstruction.Image.Width || image.Height != reconstruction.Image.Height)
                     throw new InvalidDataException("Unexpected darktable geometry; disable crop/orientation in the calibrated XMP.");
-                return ReferenceReconstruction.ApplyControls(image, recipe, token);
+                return ReferenceReconstruction.ApplyControls(image, controls, token);
             },
             async (staging, image, tiff, jpeg) =>
             {

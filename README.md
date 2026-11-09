@@ -1,7 +1,9 @@
 # Film Light
 
-A native WinUI 3 light table for Windows tablets. The untouched light area fills
-the screen above a dark, touch-sized bottom toolbar. Runs offline without browser UI.
+A native WinUI 3 light table for Windows tablets. The light area sits above a dark,
+touch-sized bottom toolbar. Roll workflow splits the workspace equally: illumination
+on the left, capture/positive preview on the right, with a full-width bottom toolbar.
+Runs offline without browser UI.
 
 ## Use
 
@@ -96,10 +98,24 @@ first reference; use separate rolls for different modes.
    white balance, focus, display brightness, geometry and lighting fixed.
 2. **Capture:** advance/focus the film and capture numbered frames. White is one
    exposure; RGB is one complete triplet. RAW+JPEG partners remain grouped together.
-   No development runs during capture, and illumination cannot change during an
-   unfinished exposure/download. Reopening a real camera lease requires fresh
-   references before adding captures.
-3. **Develop:** choose a representative frame, adjust rendering exposure, channel
+   Each complete frame is saved first, then automatically rendered as a positive
+   on the right, without leaving Capture. Previews are limited to 1600 pixels on
+   the long edge; exports retain full cropped resolution. RAW decoding still takes
+   time, especially on the first frame. If previewing fails or is canceled, the
+   saved capture stays in the roll: use **Render Preview**, not another exposure.
+   Illumination stays on the left through every phase; its size and color cannot
+   change during an unfinished exposure/download. Reopening a real camera lease
+   requires fresh references before adding captures.
+3. **Develop:** use **Pick backlight WB** to click exposed illumination with no film,
+   or **Pick film base** to click clear/unexposed developed film. Each picker switches
+   to the negative/source view; **Show negative** also lets you inspect it manually.
+   Picks average a 5 x 5 patch of the underlying reference-normalized linear input,
+   not the displayed JPEG. Backlight sampling replaces positive-output channel gains
+   to correct residual tint after light-reference normalization; film-base sampling
+   replaces measured-base multipliers. Both are saved as unaccepted recipe revisions
+   and automatically re-render the positive. These roll-wide settings do not replace
+   the required reference captures or change camera white balance.
+   In **Develop settings**, adjust rendering exposure, channel
    gains, measured film-base multipliers, black/white levels and crop, then
    **Render Preview**. Crop out dark film-holder borders before measuring the base.
    **Accept this preview** saves an immutable recipe revision; editing any setting
@@ -126,7 +142,9 @@ is not reversible RAW and cannot replace retained captures for future reinversio
 
 ### Real image processing
 
-Select **darktable-cli.exe** from a **darktable 5.6.2** installation in Develop.
+The standard `Program Files\darktable\bin\darktable-cli.exe` location is detected
+automatically. Otherwise select **darktable-cli.exe** from a **darktable 5.6.2**
+installation using **Develop settings**, available before the first frame.
 The native ARM64 darktable build requires Windows 11.
 This version is pinned because the negadoctor parameter encoding is version-specific.
 Use **RAW or RAW+JPEG** with X-T5 **UNCOMPRESSED or LOSSLESS COMPRESSED** RAF.
@@ -172,6 +190,9 @@ Requires Windows 10 2004 or newer, .NET 10 SDK and Windows SDK 10.0.26100.
 
 For an Intel Surface, use `.\tools\Publish.ps1 -Platform x64`.
 The publish folder includes the .NET and Windows App SDK runtimes; keep its files together.
+It must also include the generated `FilmLight.pri` resource index. The project
+explicitly stages it during publish: without it, WinUI can terminate with
+`0xC000027B` while loading control styles, even though the main window opens.
 This is an unpackaged desktop app, not a PWA or MSIX installer.
 
 ```powershell

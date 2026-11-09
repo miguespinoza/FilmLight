@@ -14,8 +14,9 @@ public sealed class DemoFrameProcessor : IFrameProcessor
     public async Task<PreviewResult> PreviewAsync(RollDocument roll, RollCapture frame, DevelopRecipe recipe,
         string workDirectory, IProgress<ProcessingProgress>? progress, CancellationToken cancellationToken)
     {
-        var result = await ProcessAsync(roll, frame, recipe, workDirectory, progress, cancellationToken).ConfigureAwait(false);
-        return new(result.OutputFiles[1], result.Warnings);
+        var result = await ProcessAsync(roll, frame, recipe, workDirectory, progress, cancellationToken, true).ConfigureAwait(false);
+        return new(result.OutputFiles[1], result.Warnings,
+            Path.Combine(Path.GetDirectoryName(result.OutputFiles[1])!, "source-preview.jpg"));
     }
 
     public Task<FrameProcessingResult> ExportAsync(RollDocument roll, RollCapture frame, DevelopRecipe recipe,
@@ -23,17 +24,19 @@ public sealed class DemoFrameProcessor : IFrameProcessor
         ProcessAsync(roll, frame, recipe, outputDirectory, progress, cancellationToken);
 
     private static Task<FrameProcessingResult> ProcessAsync(RollDocument roll, RollCapture frame, DevelopRecipe recipe,
-        string directory, IProgress<ProcessingProgress>? progress, CancellationToken token)
+        string directory, IProgress<ProcessingProgress>? progress, CancellationToken token, bool forPreview = false)
     {
         // Validate provenance before creating a job, even when callers accidentally choose the demo processor.
         if (!roll.IsDemo || !frame.IsDemo)
             throw new InvalidOperationException("DemoFrameProcessor rejects non-demo rolls and inputs; it is not a fallback for darktable.");
         string[] warnings = [ProcessingImages.SyntheticLabel, "Simplified synthetic renderer; no real-camera, film-color or darktable validation."];
         return ProcessingPublication.RunAsync(directory, frame, recipe, true, warnings,
-            _ => Task.Run(() =>
+            staging => Task.Run(() =>
             {
                 var reconstruction = ReferenceReconstruction.Reconstruct(roll, frame, recipe, true, token);
-                var image = reconstruction.Image;
+                var image = forPreview ? ProcessingImages.CropForPreview(reconstruction.Image, recipe, token) : reconstruction.Image;
+                var controls = forPreview ? recipe with { CropLeft = 0, CropTop = 0, CropRight = 0, CropBottom = 0 } : recipe;
+                if (forPreview) ProcessingImages.WriteSourcePreview(Path.Combine(staging, "source-preview.jpg"), image, controls, token);
                 if (recipe.FilmKind != FilmKind.Positive)
                 {
                     for (int i = 0; i < image.Pixels.Length; i++)
@@ -50,7 +53,7 @@ public sealed class DemoFrameProcessor : IFrameProcessor
                             image.Pixels[i] = image.Pixels[i + 1] = image.Pixels[i + 2] = gray;
                         }
                 }
-                return ReferenceReconstruction.ApplyControls(image, recipe, token);
+                return ReferenceReconstruction.ApplyControls(image, controls, token);
             }, token),
             (_, image, tiff, jpeg) => Task.Run(() =>
             {

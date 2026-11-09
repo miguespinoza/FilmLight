@@ -10,8 +10,12 @@ Add-Type @'
 using System;
 using System.Runtime.InteropServices;
 public static class WorkflowWindows {
+    [StructLayout(LayoutKind.Sequential)] public struct Point { public int X, Y; }
     [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr window, uint command);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr window);
+    [DllImport("user32.dll")] public static extern bool GetCursorPos(out Point point);
+    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint x, uint y, uint data, UIntPtr extra);
 }
 '@
 
@@ -139,6 +143,29 @@ function Read-Roll {
     return Get-Content -LiteralPath $script:manifest -Raw | ConvertFrom-Json
 }
 
+function Pick-SourcePoint([double]$X, [double]$Y, [int]$ExpectedRevisions) {
+    $image = Wait-Control 'Captured frame preview'
+    $bounds = $image.Current.BoundingRectangle
+    $scale = [Math]::Min($bounds.Width / 384, $bounds.Height / 256)
+    $px = $bounds.Left + ($bounds.Width - 384 * $scale) / 2 + $X * 384 * $scale
+    $py = $bounds.Top + ($bounds.Height - 256 * $scale) / 2 + $Y * 256 * $scale
+    $original = New-Object WorkflowWindows+Point
+    if (![WorkflowWindows]::GetCursorPos([ref]$original)) { throw 'Cannot read cursor position for native picker check.' }
+    try {
+        if (![WorkflowWindows]::SetCursorPos([int]$px, [int]$py)) { throw 'Cannot position pointer over source image.' }
+        [WorkflowWindows]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)
+        [WorkflowWindows]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)
+    }
+    finally { [WorkflowWindows]::SetCursorPos($original.X, $original.Y) | Out-Null }
+    $deadline = [DateTime]::UtcNow.AddSeconds(20)
+    do {
+        if (@((Read-Roll).Recipes).Count -eq $ExpectedRevisions) { break }
+        Start-Sleep -Milliseconds 80
+    } while ([DateTime]::UtcNow -lt $deadline)
+    if (@((Read-Roll).Recipes).Count -ne $ExpectedRevisions) { throw 'Source picker did not save its calibration revision.' }
+    Wait-Text 'Preview rendered for the exact current recipe' | Write-Output
+}
+
 function Wait-CompletedExports([int]$Count) {
     $deadline = [DateTime]::UtcNow.AddSeconds(60)
     do {
@@ -177,11 +204,32 @@ try {
     Invoke-Button 'Capture FILM BASE reference'
     Wait-Text 'FilmBaseReference 0 saved' | Write-Output
     Invoke-Button '2. Capture'
-    Wait-Text 'Capture the entire roll' | Write-Output
+    Wait-Text 'Capture frames:' | Write-Output
     Invoke-Button 'Capture frame 1'
     Wait-Text 'Frame 1 saved' | Write-Output
     Invoke-Button 'Capture frame 2'
     Wait-Text 'Frame 2 saved' | Write-Output
+    Wait-Text 'SYNTHETIC - Frame 2 - positive preview' | Write-Output
+    $previewBounds = (Wait-Control 'Captured frame preview').Current.BoundingRectangle
+    $toolbarBounds = (Wait-Control 'Workflow toolbar').Current.BoundingRectangle
+    $windowBounds = $script:window.Current.BoundingRectangle
+    if ($previewBounds.Left -lt $windowBounds.Left + $windowBounds.Width / 2 - 3) {
+        throw 'Capture preview is not confined to the right half.'
+    }
+    if ([Math]::Abs($toolbarBounds.Width - $windowBounds.Width) -gt 3) {
+        throw 'Bottom toolbar does not span the full window width.'
+    }
+    Invoke-Button 'Pick backlight WB'
+    Wait-Text 'Click an exposed backlight patch' | Write-Output
+    Pick-SourcePoint (3.0 / 384) .5 1
+    Invoke-Button 'Pick film base'
+    Wait-Text 'Click clear/unexposed developed film' | Write-Output
+    Pick-SourcePoint (12.0 / 384) .5 2
+    $picked = @((Read-Roll).Recipes)[-1]
+    if ($picked.Accepted -or [Math]::Abs($picked.RedGain - 1) -gt .001 -or
+        [Math]::Abs($picked.FilmBaseRed - 1) -gt .001) {
+        throw 'Synthetic backlight/base sampling did not save the expected unaccepted calibration.'
+    }
     $captured = Read-Roll
     if ($captured.Captures.Count -ne 4 -or $captured.Exports.Count -ne 0) {
         throw 'Capture phase did not retain two references/two frames separately from processing.'
@@ -206,6 +254,7 @@ try {
     Invoke-Button 'Render Preview'
     Wait-Text 'Preview rendered for the exact current recipe' | Write-Output
     if (!(Wait-Control 'Accept this preview').Current.IsEnabled) { throw 'Successful preview did not enable acceptance.' }
+    Invoke-Button 'Develop settings'
     Invoke-Button 'Increase Exposure EV'
     Wait-Text 'Unaccepted edits.' | Write-Output
     if ((Wait-Control 'Accept this preview').Current.IsEnabled) { throw 'Edited recipe was accepted without a new preview.' }
@@ -253,7 +302,7 @@ try {
     if (@((Read-Roll).Exports | Where-Object State -eq 2).Count -ne 3) {
         throw 'Resume unnecessarily duplicated successful exports.'
     }
-    Write-Output "PASS: native four-phase DEMO workflow, preview invalidation/acceptance, TIFF/JPEG jobs, missing-output retry, reopen, unchanged captures. Artifacts: $rollRoot"
+    Write-Output "PASS: split capture/auto-preview, mouse WB/base pickers, four-phase DEMO workflow, preview invalidation/acceptance, TIFF/JPEG jobs, missing-output retry, reopen, unchanged captures. Artifacts: $rollRoot"
 }
 finally {
     if (!$process.HasExited) { Stop-Process -Id $process.Id }
