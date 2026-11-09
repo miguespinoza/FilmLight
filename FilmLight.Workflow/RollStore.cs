@@ -43,6 +43,7 @@ public sealed class RollStore
         var store = new RollStore(root, new RollDocument
         {
             Name = name,
+            CreatedAt = DateTimeOffset.UtcNow,
             FilmKind = filmKind,
             IsDemo = isDemo
         });
@@ -196,7 +197,7 @@ public sealed class RollStore
         {
             using var stream = File.OpenRead(LocalPath(ManifestPath));
             using var json = JsonDocument.Parse(stream);
-            RequireProperties<RollDocument>(json.RootElement);
+            RequireProperties<RollDocument>(json.RootElement, nameof(RollDocument.CreatedAt));
             foreach (var capture in json.RootElement.GetProperty(nameof(RollDocument.Captures)).EnumerateArray())
             {
                 RequireProperties<RollCapture>(capture);
@@ -219,14 +220,14 @@ public sealed class RollStore
         }
     }
 
-    private static void RequireProperties<T>(JsonElement element)
+    private static void RequireProperties<T>(JsonElement element, string? optionalProperty = null)
     {
         if (element.ValueKind != JsonValueKind.Object)
             throw new InvalidDataException($"Expected a {typeof(T).Name} object.");
         var names = element.EnumerateObject().Select(p => p.Name).ToArray();
         var expected = typeof(T).GetProperties().Select(p => p.Name).ToArray();
-        if (names.Length != expected.Length || names.Distinct(StringComparer.Ordinal).Count() != names.Length
-            || expected.Any(name => !element.TryGetProperty(name, out _)))
+        if (names.Except(expected, StringComparer.Ordinal).Any() || names.Distinct(StringComparer.Ordinal).Count() != names.Length
+            || expected.Any(name => name != optionalProperty && !element.TryGetProperty(name, out _)))
             throw new InvalidDataException($"Incomplete or unexpected {typeof(T).Name} properties.");
     }
 

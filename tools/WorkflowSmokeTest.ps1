@@ -19,17 +19,19 @@ public static class WorkflowWindows {
 }
 '@
 
-function Find-Control([string]$Name, $Scope = $script:window) {
+function Find-Control([string]$Name, $Scope = $script:window, [switch]$ById) {
+    $property = if ($ById) { [System.Windows.Automation.AutomationElement]::AutomationIdProperty }
+        else { [System.Windows.Automation.AutomationElement]::NameProperty }
     $condition = New-Object System.Windows.Automation.PropertyCondition(
-        [System.Windows.Automation.AutomationElement]::NameProperty, $Name)
+        $property, $Name)
     return $Scope.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
 }
 
-function Wait-Control([string]$Name, $Scope = $script:window) {
+function Wait-Control([string]$Name, $Scope = $script:window, [switch]$Enabled, [switch]$ById) {
     $deadline = [DateTime]::UtcNow.AddSeconds(15)
     do {
-        $control = Find-Control $Name $Scope
-        if ($null -ne $control) { return $control }
+        $control = Find-Control $Name $Scope -ById:$ById
+        if ($null -ne $control -and (!$Enabled -or $control.Current.IsEnabled)) { return $control }
         Start-Sleep -Milliseconds 80
     } while ([DateTime]::UtcNow -lt $deadline)
     throw "Missing control: $Name"
@@ -87,56 +89,26 @@ function Wait-AppWindow([string]$Title) {
     throw "Missing app window: $Title"
 }
 
-function Select-Folder([string]$Path) {
-    $condition = [System.Windows.Automation.Condition]::TrueCondition
-    $deadline = [DateTime]::UtcNow.AddSeconds(20)
-    $picker = $null
-    do {
-        if ($null -ne (Find-Control 'Select Folder' $script:window)) {
-            $picker = $script:window
-            break
-        }
-        $candidates = [System.Windows.Automation.AutomationElement]::RootElement.FindAll(
-            [System.Windows.Automation.TreeScope]::Children, $condition)
-        foreach ($candidate in $candidates) {
-            $owner = [WorkflowWindows]::GetWindow([IntPtr]$candidate.Current.NativeWindowHandle, 4)
-            for ($depth = 0; $owner -ne [IntPtr]::Zero -and $depth -lt 8; $depth++) {
-                if ($owner -eq [IntPtr]$script:window.Current.NativeWindowHandle) { break }
-                $owner = [WorkflowWindows]::GetWindow($owner, 4)
-            }
-            if ($owner -eq [IntPtr]$script:window.Current.NativeWindowHandle) {
-                $picker = $candidate
-                break
-            }
-        }
-        if ($null -ne $picker) { break }
-        Start-Sleep -Milliseconds 100
-    } while ([DateTime]::UtcNow -lt $deadline)
-    if ($null -eq $picker) {
-        $appState = @($script:window.FindAll([System.Windows.Automation.TreeScope]::Descendants,
-            [System.Windows.Automation.Condition]::TrueCondition) | ForEach-Object { $_.Current.Name } |
-            Where-Object { $_ } | Select-Object -Unique -First 35)
-        $details = @($candidates | Where-Object {
-            $_.Current.ProcessId -eq $process.Id -or $_.Current.Name -match '^(Select|Choose|Pick).*folder'
-        } | ForEach-Object {
-            "$($_.Current.Name) [class=$($_.Current.ClassName), pid=$($_.Current.ProcessId), handle=$($_.Current.NativeWindowHandle), owner=$([WorkflowWindows]::GetWindow([IntPtr]$_.Current.NativeWindowHandle, 4))]"
-        })
-        throw "No folder picker owned by workflow handle $($script:window.Current.NativeWindowHandle) appeared. Candidates: $($details -join '; '). App state: $($appState -join '; ')"
+function Select-SavedRoll([string]$Path, [switch]$Add, [int]$ExpectedPictures = -1) {
+    $list = Wait-Control 'SavedRolls' -ById
+    if ($Add) {
+        $edit = Wait-Control 'Existing roll folder path'
+        $edit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Path)
+        Invoke-Button 'Add existing roll'
+        Wait-Control 'Resume roll' -Enabled | Out-Null
     }
-    $editCondition = New-Object System.Windows.Automation.AndCondition(
-        (New-Object System.Windows.Automation.PropertyCondition(
-            [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Edit)),
-        (New-Object System.Windows.Automation.PropertyCondition(
-            [System.Windows.Automation.AutomationElement]::NameProperty, 'Folder:')))
-    $edit = $picker.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $editCondition)
-    if ($null -eq $edit) {
-        $names = @($picker.FindAll([System.Windows.Automation.TreeScope]::Descendants,
-            [System.Windows.Automation.Condition]::TrueCondition) | ForEach-Object { $_.Current.Name } |
-            Where-Object { $_ } | Select-Object -Unique -First 45)
-        throw "Folder picker has no Folder edit. Controls: $($names -join '; ')"
+    $condition = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::ListItem)
+    $item = @($list.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition) |
+        Where-Object { $_.Current.Name.Contains($Path) } | Select-Object -First 1)
+    if ($item.Count -ne 1) { throw "Roll is missing from the in-app library: $Path" }
+    $name = $item[0].Current.Name
+    if ($name -notlike '*Created * | Updated *') { throw "Roll dates are missing: $name" }
+    if ($ExpectedPictures -ge 0 -and $name -notlike "*$ExpectedPictures pictures*") {
+        throw "Incorrect picture count in roll picker: $name"
     }
-    $edit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Path)
-    Invoke-Button 'Select Folder' $picker
+    $item[0].GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    Invoke-Button 'Resume roll'
 }
 
 function Read-Roll {
@@ -182,6 +154,9 @@ try {
     $script:window = Wait-AppWindow 'Film Light'
     Invoke-Button 'Roll workflow'
     $script:window = Wait-AppWindow 'Film Light - Roll workflow'
+    Invoke-Button 'Open / resume'
+    Wait-Control 'SavedRolls' -ById | Out-Null
+    Invoke-Button 'Cancel'
     Invoke-Button 'Demo camera'
     Wait-Text 'DEMO / SYNTHETIC - ' | Write-Output
     if ($CaptureMode -eq 'Rgb') {
@@ -192,12 +167,14 @@ try {
         $combo.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Collapse()
     }
     Invoke-Button 'New roll'
-    Select-Folder $OutputParent
-    Wait-Text 'Created ' | Write-Output
-    $rolls = @(Get-ChildItem -LiteralPath $OutputParent -Filter roll.json -Recurse)
-    if ($rolls.Count -ne 1) { throw 'Expected exactly one newly created roll manifest.' }
-    $script:manifest = $rolls[0].FullName
-    $rollRoot = $rolls[0].DirectoryName
+    $created = Wait-Text 'Created '
+    Write-Output $created
+    if ($created -notmatch '^Created (.+)\. (?:Capture a picture|Remove film)') { throw "Missing automatically created roll path: $created" }
+    $rollRoot = $Matches[1]
+    $libraryRoot = Join-Path ([Environment]::GetFolderPath('MyPictures')) 'FilmLight\Rolls'
+    if ((Split-Path $rollRoot -Parent) -ine $libraryRoot) { throw "Roll was not created in the managed library: $rollRoot" }
+    $script:manifest = Join-Path $rollRoot 'roll.json'
+    if (!(Read-Roll).CreatedAt) { throw 'New roll has no persistent creation date.' }
 
     Invoke-Button 'Capture NO-FILM reference'
     Wait-Text 'LightReference 0 saved' | Write-Output
@@ -293,7 +270,7 @@ try {
     Invoke-Button 'Roll workflow'
     $script:window = Wait-AppWindow 'Film Light - Roll workflow'
     Invoke-Button 'Open / resume'
-    Select-Folder $rollRoot
+    Select-SavedRoll $rollRoot -ExpectedPictures 2
     Invoke-Button 'Use Demo camera'
     Wait-Text 'Resumed ' | Write-Output
     Wait-Text 'SIMULATED / SYNTHETIC EXPORTS' | Write-Output

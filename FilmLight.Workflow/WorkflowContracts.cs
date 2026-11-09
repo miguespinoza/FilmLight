@@ -43,6 +43,7 @@ public sealed record RollDocument
     public int SchemaVersion { get; init; } = 1;
     public Guid Id { get; init; } = Guid.NewGuid();
     public string Name { get; init; } = "";
+    public DateTimeOffset? CreatedAt { get; init; }
     public FilmKind FilmKind { get; init; }
     public bool IsDemo { get; init; }
     public WorkflowPhase Phase { get; init; }

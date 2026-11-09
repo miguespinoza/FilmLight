@@ -65,6 +65,8 @@ public sealed class RollWorkflowWindow : Window
     private readonly Dictionary<string, TextBlock> recipeValues = [];
     private readonly HashSet<Guid> sessionReferences = [];
     private readonly DisplayRequest wake = new();
+    private readonly RollLibrary library = new(Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "FilmLight", "Rolls"));
     private readonly Action<CameraClient> cameraReleased;
     private CameraClient? camera;
     private IWorkflowCaptureSource? source;
@@ -351,7 +353,7 @@ public sealed class RollWorkflowWindow : Window
         }
     }
 
-    private static bool IsOperationalError(Exception ex) => ex is IOException or UnauthorizedAccessException
+    private static bool IsOperationalError(Exception ex) => ex is IOException or InvalidDataException or UnauthorizedAccessException
         or InvalidOperationException or ArgumentException or System.Text.Json.JsonException
         or System.Runtime.InteropServices.ExternalException or System.ComponentModel.Win32Exception or TimeoutException
         or NotSupportedException;
@@ -359,21 +361,20 @@ public sealed class RollWorkflowWindow : Window
     private async Task CreateAsync(CancellationToken token)
     {
         if (source is null) throw new InvalidOperationException("Connect a real camera in the parent window or explicitly select Demo camera.");
-        var parent = await PickFolderAsync();
-        if (parent is null) return;
         token.ThrowIfCancellationRequested();
-        var name = $"Roll {DateTime.Now:yyyy-MM-dd HHmmss}-{Guid.NewGuid().ToString("N")[..4]}";
-        var created = RollStore.Create(Path.Combine(parent, name), name, (FilmKind)filmKind.SelectedItem, source.IsDemo);
+        var kind = (FilmKind)filmKind.SelectedItem;
+        var simulated = source.IsDemo;
+        var created = await Task.Run(() => library.Create(kind, simulated), token);
         LoadRoll(created, Mode);
         message.Text = $"Created {created.RootPath}. Remove film and capture the light reference.";
     }
 
     private async Task OpenAsync(CancellationToken token)
     {
-        var path = await PickFolderAsync();
+        var path = await PickRollAsync(token);
         if (path is null) return;
         token.ThrowIfCancellationRequested();
-        var opened = RollStore.Open(path);
+        var opened = await Task.Run(() => RollStore.Open(path), token);
         if (demoSticky && !opened.Document.IsDemo)
             throw new InvalidOperationException("This window is permanently DEMO / SYNTHETIC. Close it and reopen the workflow to open a real roll.");
         if (opened.Document.IsDemo && !demoSticky)
@@ -912,12 +913,118 @@ public sealed class RollWorkflowWindow : Window
             : $"Camera released after idle confirmation; teardown error: {teardownError}. Close workflow to reconnect.";
     }
 
-    private async Task<string?> PickFolderAsync()
+    private async Task<string?> PickRollAsync(CancellationToken token)
     {
-        var picker = new Windows.Storage.Pickers.FolderPicker();
-        picker.FileTypeFilter.Add("*");
-        WinRT.Interop.InitializeWithWindow.Initialize(picker, WinRT.Interop.WindowNative.GetWindowHandle(this));
-        return (await picker.PickSingleFolderAsync())?.Path;
+        var entries = await Task.Run(() => library.List(token), token);
+        token.ThrowIfCancellationRequested();
+        var list = new ListView
+        {
+            SelectionMode = ListViewSelectionMode.Single, MinHeight = 120, MaxHeight = 350,
+            HorizontalContentAlignment = HorizontalAlignment.Stretch
+        };
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(list, "Saved rolls");
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(list, "SavedRolls");
+        var details = Text(entries.Count == 0
+            ? "No saved rolls yet. Create a new roll, or add an older roll below."
+            : "Select a roll to resume. Pictures count complete frames, not individual RGB exposures or RAW+JPEG files.");
+        var panel = new StackPanel { Spacing = 12, MinWidth = 480, MaxWidth = 680 };
+        panel.Children.Add(details);
+        panel.Children.Add(list);
+        panel.Children.Add(Text($"New rolls are saved automatically in:\n{library.RootPath}", 14));
+        var existingPath = new TextBox
+        {
+            Header = "Older roll stored elsewhere", PlaceholderText = "Paste the full roll folder path",
+            MinHeight = 48
+        };
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(existingPath, "Existing roll folder path");
+        var add = Button("Add existing roll");
+        var error = Text("");
+        error.Foreground = new SolidColorBrush(Colors.Orange);
+        panel.Children.Add(existingPath);
+        panel.Children.Add(add);
+        panel.Children.Add(error);
+        var dialog = new ContentDialog
+        {
+            XamlRoot = root.XamlRoot, Title = "Open / resume roll", Content = panel,
+            PrimaryButtonText = "Resume roll", CloseButtonText = "Cancel",
+            IsPrimaryButtonEnabled = false, DefaultButton = ContentDialogButton.Primary
+        };
+        var linking = false;
+        dialog.Closing += (_, args) => args.Cancel = linking;
+        void Populate(IReadOnlyList<RollLibraryEntry> rolls, string? selectedPath = null)
+        {
+            list.Items.Clear();
+            foreach (var entry in rolls)
+            {
+                var document = entry.Document;
+                var content = new StackPanel { Spacing = 4, Padding = new Thickness(4) };
+                content.Children.Add(Text(document is null ? Path.GetFileName(entry.RootPath)
+                    : $"{(document.IsDemo ? "DEMO / SYNTHETIC - " : "")}{document.Name}", 18));
+                if (document is not null)
+                {
+                    var pictures = document.Captures.Count(c => c.Purpose == CapturePurpose.Frame);
+                    var captureMode = document.Captures.FirstOrDefault()?.Mode;
+                    content.Children.Add(Text($"Created {entry.CreatedAt?.ToLocalTime():g} | Updated {entry.UpdatedAt?.ToLocalTime():g}", 14));
+                    content.Children.Add(Text($"{pictures} picture{(pictures == 1 ? "" : "s")} | {document.FilmKind} | " +
+                        $"{(captureMode == CaptureMode.Rgb ? "RGB" : captureMode?.ToString() ?? "No captures")} | {document.Phase}", 14));
+                }
+                content.Children.Add(Text(entry.RootPath, 13));
+                if (entry.Error is not null) content.Children.Add(Text($"Unavailable: {entry.Error}", 14));
+                var item = new ListViewItem
+                {
+                    Content = content, Tag = entry, IsEnabled = entry.Error is null
+                        && (!demoSticky || document?.IsDemo == true),
+                    HorizontalContentAlignment = HorizontalAlignment.Stretch
+                };
+                Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(item,
+                    string.Join(". ", content.Children.OfType<TextBlock>().Select(text => text.Text)));
+                list.Items.Add(item);
+                if (entry.RootPath.Equals(selectedPath, StringComparison.OrdinalIgnoreCase)) list.SelectedItem = item;
+            }
+        }
+        list.SelectionChanged += (_, _) => dialog.IsPrimaryButtonEnabled =
+            list.SelectedItem is ListViewItem { IsEnabled: true };
+        Populate(entries);
+        add.Click += async (_, _) =>
+        {
+            linking = true;
+            add.IsEnabled = false;
+            list.IsEnabled = false;
+            existingPath.IsEnabled = false;
+            dialog.IsPrimaryButtonEnabled = false;
+            error.Text = "";
+            try
+            {
+                var path = existingPath.Text.Trim().Trim('"');
+                var linked = await Task.Run(() => library.Link(path), token);
+                Populate(await Task.Run(() => library.List(token), token), linked.RootPath);
+                details.Text = "Existing roll added. Its original files stay in their current location.";
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
+            {
+                error.Text = "Adding the roll was canceled.";
+            }
+            catch (Exception ex) when (IsOperationalError(ex))
+            {
+                error.Text = $"Cannot add roll: {ex.Message}";
+            }
+            finally
+            {
+                linking = false;
+                add.IsEnabled = true;
+                list.IsEnabled = true;
+                existingPath.IsEnabled = true;
+                dialog.IsPrimaryButtonEnabled = list.SelectedItem is ListViewItem { IsEnabled: true };
+                if (token.IsCancellationRequested) dialog.Hide();
+            }
+        };
+        using var registration = token.Register(() => DispatcherQueue.TryEnqueue(() => dialog.Hide()));
+        var result = await dialog.ShowAsync();
+        token.ThrowIfCancellationRequested();
+        if (result != ContentDialogResult.Primary) return null;
+        if (list.SelectedItem is not ListViewItem { IsEnabled: true, Tag: RollLibraryEntry selected })
+            throw new InvalidOperationException("Select an available roll before resuming.");
+        return selected.RootPath;
     }
 
     private async Task<string?> PickFileAsync(string extension)

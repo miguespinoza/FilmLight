@@ -240,6 +240,106 @@ public sealed class RollStoreTests : IDisposable
         Assert.Throws<InvalidDataException>(() => RollStore.Open(Root));
     }
 
+    [Fact]
+    public void LibraryCreatesUniqueFoldersAndDiscoversFreshMetadataAfterReopening()
+    {
+        var library = new RollLibrary(Path.Combine(directory, "library"));
+        Assert.Empty(library.List());
+        var first = library.Create(FilmKind.ColorNegative, true);
+        var created = first.Document.CreatedAt;
+        Assert.NotNull(created);
+        var second = library.Create(FilmKind.Positive, false);
+        Assert.NotEqual(first.RootPath, second.RootPath);
+        Assert.StartsWith(library.RootPath + Path.DirectorySeparatorChar, first.RootPath);
+        Capture(first, CapturePurpose.LightReference, CaptureMode.Rgb);
+        Capture(first, mode: CaptureMode.Rgb);
+        Capture(first, mode: CaptureMode.Rgb);
+        var manifest = Path.Combine(first.RootPath, "roll.json");
+        var updated = DateTime.UtcNow.AddMinutes(1);
+        File.SetLastWriteTimeUtc(manifest, updated);
+
+        var entries = new RollLibrary(library.RootPath).List();
+        Assert.Equal(2, entries.Count);
+        var entry = entries[0];
+        Assert.Equal(first.RootPath, entry.RootPath);
+        Assert.Equal(created, entry.CreatedAt);
+        Assert.Equal(new DateTimeOffset(updated), entry.UpdatedAt);
+        Assert.Null(entry.Error);
+        Assert.Equal(2, entry.Document!.Captures.Count(c => c.Purpose == CapturePurpose.Frame));
+        Assert.Equal(FilmKind.ColorNegative, entry.Document.FilmKind);
+        Assert.True(entry.Document.IsDemo);
+        Assert.All(entry.Document.Captures, capture => Assert.Equal(CaptureMode.Rgb, capture.Mode));
+        Assert.Equal(created, RollStore.Open(first.RootPath).Document.CreatedAt);
+    }
+
+    [Fact]
+    public void LibraryLinksOlderRollsWithoutMovingThemAndDeduplicatesPaths()
+    {
+        var store = Create();
+        var frame = Capture(store);
+        var manifest = Path.Combine(Root, "roll.json");
+        var json = JsonNode.Parse(File.ReadAllText(manifest))!.AsObject();
+        json.Remove(nameof(RollDocument.CreatedAt));
+        json["Captures"]!.AsArray().Clear();
+        File.WriteAllText(manifest, json.ToJsonString());
+        var library = new RollLibrary(Path.Combine(directory, "library"));
+        library.Link(Root);
+        var emptyLegacy = Assert.Single(library.List());
+        Assert.NotNull(emptyLegacy.CreatedAt);
+        Assert.Empty(emptyLegacy.Document!.Captures);
+        json["Captures"] = JsonNode.Parse(System.Text.Json.JsonSerializer.Serialize(new[] { frame }));
+        File.WriteAllText(manifest, json.ToJsonString());
+        library.Link(Root + Path.DirectorySeparatorChar);
+        var entry = Assert.Single(new RollLibrary(library.RootPath).List());
+        Assert.Equal(Root, entry.RootPath);
+        Assert.Equal(frame.CapturedAt, entry.CreatedAt);
+        Assert.Null(entry.Document!.CreatedAt);
+        Assert.True(File.Exists(frame.Files[0].Path));
+        Assert.Single(System.Text.Json.JsonSerializer.Deserialize<string[]>(
+            File.ReadAllText(Path.Combine(library.RootPath, "linked-rolls.json")))!);
+        library.Link(library.Create(FilmKind.Positive, false).RootPath);
+        Assert.Equal(2, library.List().Count);
+    }
+
+    [Fact]
+    public void LibrarySurfacesBrokenRollsWithoutHidingOtherRolls()
+    {
+        var library = new RollLibrary(Path.Combine(directory, "library"));
+        var healthy = library.Create(FilmKind.Positive, true);
+        var broken = library.Create(FilmKind.Positive, true);
+        File.WriteAllText(Path.Combine(broken.RootPath, "roll.json"), "{bad");
+        library.Link(Create().RootPath);
+        File.Delete(Path.Combine(Root, "roll.json"));
+        var entries = library.List();
+        Assert.Equal(3, entries.Count);
+        Assert.Equal(healthy.RootPath, entries[0].RootPath);
+        Assert.Null(entries[0].Error);
+        Assert.All(entries.Skip(1), entry =>
+        {
+            Assert.Null(entry.Document);
+            Assert.False(string.IsNullOrWhiteSpace(entry.Error));
+        });
+        Assert.Throws<InvalidDataException>(() => library.Link(broken.RootPath));
+        using var canceled = new CancellationTokenSource();
+        canceled.Cancel();
+        Assert.Throws<OperationCanceledException>(() => library.List(canceled.Token));
+    }
+
+    [Fact]
+    public void LibraryRejectsInvalidLinksAndSurfacesCorruptRegistry()
+    {
+        var library = new RollLibrary(Path.Combine(directory, "library"));
+        Assert.Throws<ArgumentException>(() => library.Link("relative-roll"));
+        Assert.Throws<DirectoryNotFoundException>(() => library.Link(Path.Combine(directory, "missing")));
+        library.Create(FilmKind.Positive, true);
+        var links = Path.Combine(library.RootPath, "linked-rolls.json");
+        foreach (var invalid in new[] { "{bad", "null", "[null]", "[\"relative-roll\"]" })
+        {
+            File.WriteAllText(links, invalid);
+            Assert.Throws<InvalidDataException>(() => library.List());
+        }
+    }
+
     private RollStore Create(FilmKind kind = FilmKind.Positive, bool isDemo = true) =>
         RollStore.Create(Root, "Test roll", kind, isDemo);
 

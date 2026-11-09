@@ -88,8 +88,17 @@ to try the entire workflow without hardware. Demo windows, files, previews and
 exports stay labelled **DEMO / SYNTHETIC**; the synthetic renderer is never a fallback
 for real captures.
 
-Choose the film kind and White or RGB mode, then **New roll** and a parent folder.
-The app creates a uniquely named roll folder. The capture mode is fixed after the
+Choose the film kind and White or RGB mode, then **New roll**.
+The app automatically creates a uniquely named folder under `Pictures\FilmLight\Rolls`;
+there is no folder-selection step. **Open / resume** shows an in-app roll library
+with creation/update dates, picture counts, film kind, capture mode and workflow phase.
+RGB triplets and RAW+JPEG pairs count as one picture; reference exposures are excluded.
+Demo rolls are clearly labelled, and unavailable rolls show their error.
+For an older roll outside the library, paste its full folder path under
+**Older roll stored elsewhere** and choose **Add existing roll** once; the app
+remembers it without moving its files. Metadata stays in each roll's `roll.json`,
+with linked folder paths in `Pictures\FilmLight\Rolls\linked-rolls.json`; no database is required.
+The capture mode is fixed after the
 first reference; use separate rolls for different modes.
 
 1. **References:** capture **NO-FILM** illumination, then a **FILM BASE** reference
@@ -211,8 +220,9 @@ the no-camera error path. `-SkipPixels` explicitly disables screen-pixel checks 
 the desktop is unavailable to GDI; UI Automation checks still run.
 
 The four-phase native workflow smoke check uses an explicitly synthetic camera,
-exercises preview invalidation/acceptance, TIFF/JPEG export, missing-output retry
-and reopening, and leaves its demo roll under `artifacts`:
+exercises preview invalidation/acceptance, TIFF/JPEG export, missing-output retry,
+automatic folder creation and the metadata-rich resume dialog. It leaves its demo
+roll under `Pictures\FilmLight\Rolls`:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\WorkflowSmokeTest.ps1
