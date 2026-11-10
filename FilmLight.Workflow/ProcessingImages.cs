@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.Drawing;
 using System.Drawing.Imaging;
+using System.Numerics;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 using BitMiracle.LibTiff.Classic;
@@ -9,7 +10,7 @@ namespace FilmLight.Workflow;
 
 internal sealed record LinearImage(int Width, int Height, float[] Pixels);
 
-internal static class ProcessingImages
+internal static partial class ProcessingImages
 {
     internal const string SyntheticLabel = "SYNTHETIC Film Light - not a camera capture";
     internal const string LinearLabel = "FilmLight linear Rec2020; black-subtracted; exposure-locked";
@@ -40,9 +41,16 @@ internal static class ProcessingImages
         {
             token.ThrowIfCancellationRequested();
             if (!tif.ReadScanline(row, y)) throw new InvalidDataException($"Truncated TIFF at row {y}: {path}");
+            if (bits == 32)
+            {
+                var samples = MemoryMarshal.Cast<byte, float>(row.AsSpan(0, width * 3 * 4));
+                ValidateSamples(samples, $"Invalid linear sample in {path}, row {y}.");
+                samples.CopyTo(pixels.AsSpan(y * width * 3, width * 3));
+                continue;
+            }
             for (int i = 0; i < width * 3; i++)
             {
-                float value = bits == 16 ? BitConverter.ToUInt16(row, i * 2) / 65535f : BitConverter.ToSingle(row, i * 4);
+                float value = BitConverter.ToUInt16(row, i * 2) / 65535f;
                 // Camera-profile matrices and black-subtracted noise legitimately produce signed RGB.
                 if (!float.IsFinite(value))
                     throw new InvalidDataException($"Invalid linear sample in {path}, row {y}.");
@@ -72,16 +80,30 @@ internal static class ProcessingImages
         for (int y = 0; y < image.Height; y++)
         {
             token.ThrowIfCancellationRequested();
-            for (int x = 0; x < image.Width * 3; x++)
+            var samples = image.Pixels.AsSpan(y * image.Width * 3, image.Width * 3);
+            ValidateSamples(samples, "Non-finite image sample.");
+            if (floating) MemoryMarshal.AsBytes(samples).CopyTo(row);
+            else for (int x = 0; x < image.Width * 3; x++)
             {
-                float v = image.Pixels[y * image.Width * 3 + x];
-                if (!float.IsFinite(v)) throw new InvalidDataException("Non-finite image sample.");
-                if (floating) BitConverter.TryWriteBytes(row.AsSpan(x * 4, 4), v);
-                else BitConverter.TryWriteBytes(row.AsSpan(x * 2, 2), (ushort)Math.Round(Math.Clamp(v, 0, 1) * 65535));
+                BitConverter.TryWriteBytes(row.AsSpan(x * 2, 2), (ushort)Math.Round(Math.Clamp(samples[x], 0, 1) * 65535));
             }
             if (!tif.WriteScanline(row, y)) throw new IOException($"Cannot write TIFF row {y}: {path}");
         }
         if (!tif.WriteDirectory()) throw new IOException($"Cannot finish TIFF: {path}");
+    }
+
+    private static void ValidateSamples(ReadOnlySpan<float> samples, string message)
+    {
+        int i = 0;
+        if (Vector.IsHardwareAccelerated)
+        {
+            var limit = new Vector<float>(float.MaxValue);
+            for (; i <= samples.Length - Vector<float>.Count; i += Vector<float>.Count)
+                if (!Vector.LessThanOrEqualAll(Vector.Abs(new Vector<float>(samples.Slice(i, Vector<float>.Count))), limit))
+                    throw new InvalidDataException(message);
+        }
+        for (; i < samples.Length; i++)
+            if (!float.IsFinite(samples[i])) throw new InvalidDataException(message);
     }
 
     internal static void ValidateMaster(string path, int width, int height, bool requireProfile, CancellationToken token)
@@ -126,11 +148,10 @@ internal static class ProcessingImages
         for (int i = 0; i < small.Pixels.Length; i += 3)
         {
             if ((i & 65535) == 0) token.ThrowIfCancellationRequested();
-            float r = small.Pixels[i], g = small.Pixels[i + 1], b = small.Pixels[i + 2];
-            // Linear Rec2020 to linear sRGB; this view is for locating source patches.
-            small.Pixels[i] = 1.660491f * r - .587641f * g - .072850f * b;
-            small.Pixels[i + 1] = -.124550f * r + 1.132900f * g - .008349f * b;
-            small.Pixels[i + 2] = -.018151f * r - .100579f * g + 1.118730f * b;
+            var (r, g, b) = ToLinearSrgb(small.Pixels[i], small.Pixels[i + 1], small.Pixels[i + 2]);
+            small.Pixels[i] = r;
+            small.Pixels[i + 1] = g;
+            small.Pixels[i + 2] = b;
         }
         WriteJpeg(path, small, token);
     }

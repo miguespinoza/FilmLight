@@ -110,15 +110,17 @@ public sealed class RollStoreTests : IDisposable
         Assert.Equal(WorkflowPhase.Export, RollStore.Open(Root).Document.Phase);
     }
 
-    [Fact]
-    public void PicturePicksReplaceReferencesAndSurviveReopenForEveryFrame()
+    [Theory]
+    [InlineData(384, 256)]
+    [InlineData(2560, 1706)]
+    public void PicturePicksReplaceReferencesAndSurviveReopenForEveryFrame(int measuredWidth, int measuredHeight)
     {
         var store = Create(FilmKind.ColorNegative);
         store.SetPhase(WorkflowPhase.Capture);
         var first = Capture(store);
         var second = Capture(store);
-        var light = new PictureSample(first.Id, .1, .2, .8, .7, .6);
-        var basis = new PictureSample(first.Id, .3, .4, .6, .3, .2);
+        var light = new PictureSample(first.Id, .1, .2, .8, .7, .6) { SourceWidth = measuredWidth, SourceHeight = measuredHeight };
+        var basis = new PictureSample(first.Id, .3, .4, .6, .3, .2) { SourceWidth = measuredWidth, SourceHeight = measuredHeight };
         var recipe = new DevelopRecipe
         {
             FilmKind = FilmKind.ColorNegative, PictureCalibration = new() { Light = light }
@@ -141,6 +143,68 @@ public sealed class RollStoreTests : IDisposable
     }
 
     [Fact]
+    public void FrameCalibrationRevisionsRemainIndependentAndCannotExportAnotherFrame()
+    {
+        var store = Create(FilmKind.ColorNegative);
+        var first = Capture(store, mode: CaptureMode.White);
+        var second = Capture(store, mode: CaptureMode.Rgb);
+        var saved = store.SaveRecipe(new()
+        {
+            FrameId = first.Id, FilmKind = FilmKind.ColorNegative,
+            PictureCalibration = new()
+            {
+                Light = new(first.Id, .1, .2, .8, .7, .6),
+                FilmBase = new(first.Id, .3, .4, .5, .25, .1)
+            }
+        }, true);
+        var secondRecipe = saved.ForFrame(second.Id);
+        Assert.Null(secondRecipe.PictureCalibration);
+        var other = store.SaveRecipe(secondRecipe with
+        {
+            PictureCalibration = new()
+            {
+                Light = new(second.Id, .1, .2, .4, .35, .3),
+                FilmBase = new(second.Id, .3, .4, .25, .125, .05)
+            }
+        }, true);
+        var reopened = RollStore.Open(Root);
+        Assert.Equal(saved, reopened.Document.Recipes[0]);
+        Assert.Equal(other, reopened.Document.Recipes[1]);
+        Assert.Throws<InvalidOperationException>(() => store.SaveRecipe(saved with { FrameId = second.Id }, false));
+        Assert.Throws<InvalidOperationException>(() => store.SaveRecipe(other with
+        {
+            PictureCalibration = saved.PictureCalibration
+        }, false));
+        Assert.Throws<InvalidDataException>(() => store.RecordExport(new(second.Id, saved.Id, saved.Revision,
+            ExportState.Failed, [], "Must not use another frame's recipe.", DateTimeOffset.UtcNow)));
+        var edited = store.SaveRecipe(other with { ExposureEv = 1 }, true);
+        Assert.Equal(other.Revision + 1, edited.Revision);
+        Assert.Equal(saved, RollStore.Open(Root).Document.Recipes[0]);
+    }
+
+    [Fact]
+    public void ClippedStatusDoesNotBypassInvalidSampleOrFilmBaseValidation()
+    {
+        var store = Create(FilmKind.ColorNegative);
+        var frame = Capture(store);
+        var light = new PictureSample(frame.Id, .1, .2, 1.05, .7, .6) { IsClipped = true };
+        var basis = new PictureSample(frame.Id, .3, .4, .6, .3, .2);
+        PictureCalibration[] invalid =
+        [
+            new() { Light = light with { Red = double.NaN }, FilmBase = basis },
+            new() { Light = light with { Green = double.PositiveInfinity }, FilmBase = basis },
+            new() { Light = light with { Blue = 0 }, FilmBase = basis },
+            new() { Light = light, FilmBase = basis with { IsClipped = true } }
+        ];
+        foreach (var picture in invalid)
+            Assert.Throws<ArgumentException>(() => store.SaveRecipe(new()
+            {
+                FilmKind = FilmKind.ColorNegative, PictureCalibration = picture
+            }, true));
+        Assert.Empty(RollStore.Open(Root).Document.Recipes);
+    }
+
+    [Fact]
     public void OlderRecipesWithoutPictureCalibrationRemainReadable()
     {
         var store = Ready();
@@ -148,8 +212,33 @@ public sealed class RollStoreTests : IDisposable
         var manifest = Path.Combine(Root, "roll.json");
         var json = JsonNode.Parse(File.ReadAllText(manifest))!.AsObject();
         json["Recipes"]![0]!.AsObject().Remove(nameof(DevelopRecipe.PictureCalibration));
+        json["Recipes"]![0]!.AsObject().Remove(nameof(DevelopRecipe.FrameId));
         File.WriteAllText(manifest, json.ToJsonString());
         Assert.Equal(saved, RollStore.Open(Root).Document.Recipes.Single());
+    }
+
+    [Fact]
+    public void OlderPicturePicksWithoutMarkerGeometryKeepTheirMeasuredColors()
+    {
+        var store = Create(FilmKind.Positive);
+        var frame = Capture(store);
+        var light = new PictureSample(frame.Id, .1, .2, .8, .7, .6) { SourceWidth = 384, SourceHeight = 256 };
+        var saved = store.SaveRecipe(new DevelopRecipe
+        {
+            FilmKind = FilmKind.Positive, PictureCalibration = new() { Light = light }
+        }, true);
+        var manifest = Path.Combine(Root, "roll.json");
+        var json = JsonNode.Parse(File.ReadAllText(manifest))!.AsObject();
+        var sample = json["Recipes"]![0]![nameof(DevelopRecipe.PictureCalibration)]!["Light"]!.AsObject();
+        sample.Remove(nameof(PictureSample.SourceWidth));
+        sample.Remove(nameof(PictureSample.SourceHeight));
+        sample.Remove(nameof(PictureSample.IsClipped));
+        File.WriteAllText(manifest, json.ToJsonString());
+        var reopened = RollStore.Open(Root).Document.Recipes.Single();
+        Assert.Equal(saved with
+        {
+            PictureCalibration = new() { Light = light with { SourceWidth = 0, SourceHeight = 0 } }
+        }, reopened);
     }
 
     [Fact]

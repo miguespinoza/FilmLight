@@ -8,8 +8,7 @@ internal static class ProcessingPublication
 {
     internal static async Task<FrameProcessingResult> RunAsync(string directory, RollCapture frame,
         DevelopRecipe recipe, bool synthetic, IReadOnlyList<string> warnings,
-        Func<string, Task<LinearImage>> render,
-        Func<string, LinearImage, string, string, Task> encode,
+        DevelopIntent intent, Func<string, Task<LinearImage>> render,
         IProgress<ProcessingProgress>? progress, CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
@@ -28,19 +27,22 @@ internal static class ProcessingPublication
                 ? "Preparing synthetic input; this is not a real-camera conversion."
                 : "Preparing the positive conversion. Original captures remain untouched."));
             var image = await render(staging).ConfigureAwait(false);
-            string tiff = Path.Combine(staging, synthetic ? "SYNTHETIC-master.tif" : "master.tif");
-            string jpeg = Path.Combine(staging, synthetic ? "SYNTHETIC-preview.jpg" : "preview.jpg");
-            progress?.Report(new(frame.Id, "Saving positive images", "Writing the TIFF master and JPEG companion."));
-            await encode(staging, image, tiff, jpeg).ConfigureAwait(false);
+            var paths = Paths(staging, synthetic, intent);
             token.ThrowIfCancellationRequested();
-            progress?.Report(new(frame.Id, "Validating output", "Checking the saved TIFF and JPEG before publishing."));
-            ProcessingImages.ValidateMaster(tiff, image.Width, image.Height, !synthetic, token);
-            ProcessingImages.ValidateJpeg(jpeg, image.Width, image.Height, !synthetic);
+            progress?.Report(new(frame.Id, "Validating output", intent == DevelopIntent.Preview
+                ? "Checking the saved PNG before publishing." : "Checking the saved TIFF and JPEG before publishing."));
+            if (intent == DevelopIntent.Preview)
+                ProcessingImages.ValidatePng(paths[0], image.Width, image.Height, true);
+            else
+            {
+                ProcessingImages.ValidateMaster(paths[0], image.Width, image.Height, !synthetic, token);
+                ProcessingImages.ValidateJpeg(paths[1], image.Width, image.Height, !synthetic);
+            }
             token.ThrowIfCancellationRequested();
             string published = Path.Combine(directory, name);
             progress?.Report(new(frame.Id, "Publishing output", "Making the completed positive images available."));
             Directory.Move(staging, published);
-            return new(new[] { Path.Combine(published, Path.GetFileName(tiff)), Path.Combine(published, Path.GetFileName(jpeg)) }, warnings);
+            return new(paths.Select(path => Path.Combine(published, Path.GetFileName(path))).ToArray(), warnings);
         }
         catch (Exception error)
         {
@@ -48,5 +50,14 @@ internal static class ProcessingPublication
             File.WriteAllText(Path.Combine(staging, "failure.txt"), error.ToString());
             throw;
         }
+
+    }
+
+    internal static string[] Paths(string directory, bool synthetic, DevelopIntent intent)
+    {
+        string prefix = synthetic ? "SYNTHETIC-" : "";
+        return intent == DevelopIntent.Preview
+            ? [Path.Combine(directory, prefix + "preview.png")]
+            : [Path.Combine(directory, prefix + "master.tif"), Path.Combine(directory, prefix + "preview.jpg")];
     }
 }

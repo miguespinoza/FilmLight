@@ -61,6 +61,9 @@ public sealed class DemoCaptureSource : IWorkflowCaptureSource
                 {
                     transmission = filmBase[c];
                     if (purpose == CapturePurpose.Frame && x < 8) transmission = 1;
+                    if (purpose == CapturePurpose.Frame && y is >= 2 and < 16
+                        && x >= 32 && x < width - 32 && x % 32 < 12)
+                        transmission = 1;
                     if (purpose == CapturePurpose.Frame && x > 18 && x < width - 19 && y > 18 && y < height - 19)
                     {
                         double scene = .12 + .72 * ((x + number * 17 + c * 53) % (width - 38)) / (width - 38);

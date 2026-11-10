@@ -1,4 +1,3 @@
-using BitMiracle.LibTiff.Classic;
 using FilmLight.Core;
 
 namespace FilmLight.Workflow;
@@ -7,15 +6,19 @@ internal sealed record ReconstructedFrame(LinearImage Image, float[] FilmBase);
 
 internal static class ReferenceReconstruction
 {
-    internal static ReconstructedFrame Reconstruct(RollDocument roll, RollCapture frame,
-        DevelopRecipe recipe, bool demoOnly, CancellationToken token)
+    internal static async Task<ReconstructedFrame> ReconstructAsync(FrameSources sources, RollDocument roll, RollCapture frame,
+        DevelopRecipe recipe, bool demoOnly, int minLongEdge, CancellationToken token,
+        IProgress<ProcessingProgress>? progress = null)
     {
         ValidateFrame(roll, frame, recipe, demoOnly);
+        var source = sources.Open(roll, frame);
+        var image = await source.GetImageAsync(minLongEdge, token, progress).ConfigureAwait(false);
+        var exposure = await source.GetExposureAsync(token).ConfigureAwait(false);
         if (recipe.PictureCalibration is { } picture)
         {
-            picture.Validate(roll, frame.Mode);
-            var image = Compose(frame, roll.IsDemo, token);
-            double[] light = picture.Light is { } l ? [l.Red, l.Green, l.Blue] : [1, 1, 1];
+            picture.Validate(roll, frame.Mode, frame.Id);
+            progress?.Report(new(frame.Id, "Normalizing film", "Applying this frame's own light and film samples to the linear input."));
+            double[] light = picture.Light is { IsClipped: false } l ? [l.Red, l.Green, l.Blue] : [1, 1, 1];
             double[] basis = picture.FilmBase is { } b ? [b.Red, b.Green, b.Blue] : light;
             double[] adjustments = [recipe.FilmBaseRed, recipe.FilmBaseGreen, recipe.FilmBaseBlue];
             float[] filmBase = [1, 1, 1];
@@ -35,12 +38,39 @@ internal static class ReferenceReconstruction
             }
             return new(image, filmBase);
         }
-        return ReconstructReferences(roll, frame, recipe, token);
+        var lightCapture = Reference(roll, frame, CapturePurpose.LightReference);
+        var lightSource = sources.Open(roll, lightCapture);
+        CheckExposure(exposure, await lightSource.GetExposureAsync(token).ConfigureAwait(false));
+        var lightImage = await lightSource.GetImageAsync(minLongEdge, token, progress).ConfigureAwait(false);
+        LinearImage? baseImage = null;
+        if (recipe.FilmKind != FilmKind.Positive)
+        {
+            var baseSource = sources.Open(roll, Reference(roll, frame, CapturePurpose.FilmBaseReference));
+            CheckExposure(exposure, await baseSource.GetExposureAsync(token).ConfigureAwait(false));
+            baseImage = await baseSource.GetImageAsync(minLongEdge, token, progress).ConfigureAwait(false);
+        }
+        progress?.Report(new(frame.Id, "Normalizing film", "Applying the roll's light and film settings to the linear input."));
+        return ReconstructReferences(image, lightImage, baseImage, recipe, token);
     }
 
-    private static void ValidateFrame(RollDocument roll, RollCapture frame, DevelopRecipe recipe, bool demoOnly)
+    private static void CheckExposure(Exposure? exposure, Exposure? other)
+    {
+        if (exposure is not null && other is not null && !exposure.Matches(other))
+            throw new InvalidDataException(FrameSources.ExposureMismatch);
+    }
+
+    internal static int PreviewSize(DevelopRecipe recipe)
     {
         ValidateRecipe(recipe);
+        double fraction = Math.Max(1 - recipe.CropLeft - recipe.CropRight, 1 - recipe.CropTop - recipe.CropBottom);
+        return (int)Math.Min(FrameSources.FullResolution, Math.Ceiling(1600 / fraction));
+    }
+
+    internal static void ValidateFrame(RollDocument roll, RollCapture frame, DevelopRecipe recipe, bool demoOnly)
+    {
+        ValidateRecipe(recipe);
+        if (recipe.FrameId.HasValue && recipe.FrameId != frame.Id)
+            throw new InvalidOperationException("Use this frame's own calibration recipe, not another frame's settings.");
         if (frame.Purpose != CapturePurpose.Frame || !roll.Captures.Any(c => c.Id == frame.Id))
             throw new InvalidOperationException("The selected frame must belong to this roll.");
         if (roll.FilmKind != recipe.FilmKind)
@@ -51,16 +81,14 @@ internal static class ReferenceReconstruction
             throw new InvalidOperationException("Real and synthetic captures cannot be mixed.");
     }
 
-    private static ReconstructedFrame ReconstructReferences(RollDocument roll, RollCapture frame,
+    private static ReconstructedFrame ReconstructReferences(LinearImage image, LinearImage light, LinearImage? basis,
         DevelopRecipe recipe, CancellationToken token)
     {
-        var light = Reference(roll, frame, CapturePurpose.LightReference);
-        var basis = recipe.FilmKind == FilmKind.Positive ? null : Reference(roll, frame, CapturePurpose.FilmBaseReference);
-        var normalized = Normalize(frame, light, recipe, roll.IsDemo, token);
+        var normalized = Normalize(image, light, recipe, token);
         float[] filmBase = [1, 1, 1];
         if (basis is not null)
         {
-            var baseImage = Normalize(basis, light, recipe, roll.IsDemo, token);
+            var baseImage = Normalize(basis, light, recipe, token);
             Match(normalized, baseImage);
             var (left, top, width, height) = Crop(baseImage, recipe);
             double[] sums = [0, 0, 0];
@@ -82,83 +110,29 @@ internal static class ReferenceReconstruction
         return new(normalized, filmBase);
     }
 
-    private static LinearImage Compose(RollCapture capture, bool synthetic, CancellationToken token)
-    {
-        LightChannel[] channels = capture.Mode == CaptureMode.White ? [LightChannel.White] :
-            [LightChannel.Red, LightChannel.Green, LightChannel.Blue];
-        ValidateFiles(capture, channels);
-        LinearImage? result = null;
-        foreach (var channel in channels)
-        {
-            var source = Read(capture.Files.Single(f => f.Channel == channel).Path, synthetic, token);
-            if (capture.Mode == CaptureMode.White) return source;
-            result ??= new(source.Width, source.Height, new float[source.Pixels.Length]);
-            Match(result, source);
-            int selected = channel switch { LightChannel.Red => 0, LightChannel.Green => 1, _ => 2 };
-            for (int i = selected; i < source.Pixels.Length; i += 3)
-            {
-                if ((i & 65535) < 3) token.ThrowIfCancellationRequested();
-                result.Pixels[i] = source.Pixels[i];
-            }
-        }
-        return result ?? throw new InvalidDataException("Capture has no channels.");
-    }
-
     private static RollCapture Reference(RollDocument roll, RollCapture frame, CapturePurpose purpose) =>
         roll.Captures.Where(c => c.Purpose == purpose && c.Mode == frame.Mode && c.IsDemo == frame.IsDemo &&
                 c.CapturedAt <= frame.CapturedAt)
             .OrderBy(c => c.CapturedAt).ThenBy(c => c.Id).LastOrDefault()
         ?? throw new InvalidOperationException($"Missing matching {frame.Mode} {purpose} captured before this frame. Capture no-film light and clear-film base references with identical camera exposure, focus and registration.");
 
-    private static LinearImage Normalize(RollCapture capture, RollCapture light, DevelopRecipe recipe,
-        bool synthetic, CancellationToken token)
+    private static LinearImage Normalize(LinearImage source, LinearImage reference, DevelopRecipe recipe,
+        CancellationToken token)
     {
-        var channels = capture.Mode == CaptureMode.White ? new[] { LightChannel.White } :
-            new[] { LightChannel.Red, LightChannel.Green, LightChannel.Blue };
-        ValidateFiles(capture, channels);
-        ValidateFiles(light, channels);
-        LinearImage? result = null;
-        foreach (var channel in channels)
+        Match(source, reference);
+        var result = new LinearImage(source.Width, source.Height, new float[source.Pixels.Length]);
+        var (left, top, width, height) = Crop(source, recipe);
+        for (int i = 0; i < source.Pixels.Length; i++)
         {
-            var source = Read(capture.Files.Single(f => f.Channel == channel).Path, synthetic, token);
-            var reference = Read(light.Files.Single(f => f.Channel == channel).Path, synthetic, token);
-            Match(source, reference);
-            if (result is null) result = new(source.Width, source.Height, new float[source.Pixels.Length]);
-            Match(source, result);
-            var (left, top, width, height) = Crop(source, recipe);
-            int selected = channel switch { LightChannel.Red => 0, LightChannel.Green => 1, LightChannel.Blue => 2, _ => -1 };
-            for (int i = 0; i < source.Pixels.Length; i++)
-            {
-                if ((i & 65535) == 0) token.ThrowIfCancellationRequested();
-                if (selected >= 0 && i % 3 != selected) continue;
-                int pixel = i / 3, x = pixel % source.Width, y = pixel / source.Width;
-                if (x < left || x >= left + width || y < top || y >= top + height) continue;
-                float l = reference.Pixels[i], s = source.Pixels[i];
-                if (l <= .0001f || l >= .99999f || s >= .99999f)
-                    throw new InvalidDataException("Dark or clipped capture/reference sample inside the crop. Crop out film-holder borders or recapture at a physically controlled matching exposure; no automatic exposure compensation is assumed.");
-                result.Pixels[i] = s / l;
-            }
+            if ((i & 65535) == 0) token.ThrowIfCancellationRequested();
+            int pixel = i / 3, x = pixel % source.Width, y = pixel / source.Width;
+            if (x < left || x >= left + width || y < top || y >= top + height) continue;
+            float l = reference.Pixels[i], s = source.Pixels[i];
+            if (l <= .0001f || l >= .99999f || s >= .99999f)
+                throw new InvalidDataException("Dark or clipped capture/reference sample inside the crop. Crop out film-holder borders or recapture at a physically controlled matching exposure; no automatic exposure compensation is assumed.");
+            result.Pixels[i] = s / l;
         }
-        return result ?? throw new InvalidDataException("Capture has no channels.");
-    }
-
-    private static LinearImage Read(string path, bool synthetic, CancellationToken token)
-    {
-        if (!Path.GetExtension(path).Equals(".tif", StringComparison.OrdinalIgnoreCase) &&
-            !Path.GetExtension(path).Equals(".tiff", StringComparison.OrdinalIgnoreCase))
-            throw new NotSupportedException("Linear reconstruction requires qualified linear RGB TIFFs. Decode camera RAF input first; camera JPEGs cannot substitute for linear RAW.");
-        using (var tif = Tiff.Open(path, "r") ?? throw new InvalidDataException($"Cannot decode {path}"))
-            if ((tif.GetField(TiffTag.IMAGEDESCRIPTION)?[0].ToString() ?? "").Contains(
-                    ProcessingImages.SyntheticLabel, StringComparison.Ordinal) != synthetic)
-                throw new InvalidDataException("Synthetic image labels and roll provenance disagree. Never mix real inputs with a demo roll, or relabel synthetic images as real.");
-        return ProcessingImages.ReadLinear(path, token, requireQualification: true);
-    }
-
-    private static void ValidateFiles(RollCapture capture, LightChannel[] channels)
-    {
-        if (capture.Files.Count != channels.Length ||
-            channels.Any(c => capture.Files.Count(f => f.Channel == c) != 1))
-            throw new InvalidDataException($"Capture {capture.Id} requires exactly one TIFF for each of: {string.Join(", ", channels)}.");
+        return result;
     }
 
     private static void Match(LinearImage a, LinearImage b)
@@ -167,52 +141,13 @@ internal static class ReferenceReconstruction
             throw new InvalidDataException("Frame channels and any reference images must have identical dimensions and registration.");
     }
 
-    internal static DevelopRecipe AutoSample(RollDocument roll, RollCapture frame, DevelopRecipe recipe,
-        CancellationToken token)
-    {
-        ValidateFrame(roll, frame, recipe, roll.IsDemo);
-        var picture = SprocketCalibration.Detect(Compose(frame, roll.IsDemo, token), frame.Id,
-            recipe.FilmKind != FilmKind.Positive, token);
-        return recipe with { PictureCalibration = picture, Accepted = false, AcceptedAt = null };
-    }
-
-    internal static DevelopRecipe Sample(RollDocument roll, RollCapture frame, DevelopRecipe recipe,
+    internal static async Task<DevelopRecipe> SampleAsync(FrameSources sources, RollDocument roll, RollCapture frame, DevelopRecipe recipe,
         CalibrationTarget target, double x, double y, CancellationToken token)
     {
-        if (recipe.PictureCalibration is { } picture)
-        {
-            ValidateFrame(roll, frame, recipe, roll.IsDemo);
-            picture.Validate(roll, frame.Mode);
-            var image = Compose(frame, roll.IsDemo, token);
-            var (sx, sy, sw, sh) = Crop(image, recipe);
-            int sampleX = sx + (int)(x * sw), sampleY = sy + (int)(y * sh);
-            double[] sums = [0, 0, 0];
-            int count = 0;
-            for (int y0 = Math.Max(sy, sampleY - 2); y0 <= Math.Min(sy + sh - 1, sampleY + 2); y0++)
-            for (int x0 = Math.Max(sx, sampleX - 2); x0 <= Math.Min(sx + sw - 1, sampleX + 2); x0++)
-            {
-                token.ThrowIfCancellationRequested();
-                for (int c = 0; c < 3; c++)
-                {
-                    float value = image.Pixels[(y0 * image.Width + x0) * 3 + c];
-                    if (value <= .0001f || value >= .99999f)
-                        throw new InvalidDataException("The selected patch is dark or clipped. Pick evenly lit backlight / clear film away from edges.");
-                    sums[c] += value;
-                }
-                count++;
-            }
-            var sample = new PictureSample(frame.Id, x, y, sums[0] / count, sums[1] / count, sums[2] / count);
-            sample.Validate();
-            return recipe with
-            {
-                PictureCalibration = target == CalibrationTarget.Backlight ? picture with { Light = sample } : picture with { FilmBase = sample },
-                Accepted = false, AcceptedAt = null
-            };
-        }
-        var baseline = Reconstruct(roll, frame, recipe with
+        var baseline = await ReconstructAsync(sources, roll, frame, recipe with
         {
             FilmBaseRed = 1, FilmBaseGreen = 1, FilmBaseBlue = 1
-        }, roll.IsDemo, token);
+        }, roll.IsDemo, FrameSources.FullResolution, token).ConfigureAwait(false);
         var (left, top, width, height) = Crop(baseline.Image, recipe);
         int px = left + (int)(x * width), py = top + (int)(y * height);
         var values = Average(baseline.Image);
@@ -224,6 +159,7 @@ internal static class ReferenceReconstruction
                 RedGain = values[1] / values[0], GreenGain = 1, BlueGain = values[1] / values[2]
             });
         }
+
         return Checked(recipe with
         {
             FilmBaseRed = values[0] / baseline.FilmBase[0],
@@ -260,7 +196,7 @@ internal static class ReferenceReconstruction
 
     internal static void ValidateRecipe(DevelopRecipe r)
     {
-        r.PictureCalibration?.Light?.Validate();
+        r.PictureCalibration?.Light?.Validate(allowClipped: true);
         r.PictureCalibration?.FilmBase?.Validate();
         if (!Enum.IsDefined(r.FilmKind) || r.Revision < 1 ||
             !double.IsFinite(r.ExposureEv) || Math.Abs(r.ExposureEv) > 16 ||
@@ -293,12 +229,15 @@ internal static class ReferenceReconstruction
         return output;
     }
 
-    internal static (int Left, int Top, int Width, int Height) Crop(LinearImage source, DevelopRecipe recipe)
+    internal static (int Left, int Top, int Width, int Height) Crop(LinearImage source, DevelopRecipe recipe) =>
+        Crop(source.Width, source.Height, recipe);
+
+    internal static (int Left, int Top, int Width, int Height) Crop(int sourceWidth, int sourceHeight, DevelopRecipe recipe)
     {
-        int left = (int)Math.Floor(source.Width * recipe.CropLeft);
-        int top = (int)Math.Floor(source.Height * recipe.CropTop);
-        int width = source.Width - left - (int)Math.Floor(source.Width * recipe.CropRight);
-        int height = source.Height - top - (int)Math.Floor(source.Height * recipe.CropBottom);
+        int left = (int)Math.Floor(sourceWidth * recipe.CropLeft);
+        int top = (int)Math.Floor(sourceHeight * recipe.CropTop);
+        int width = sourceWidth - left - (int)Math.Floor(sourceWidth * recipe.CropRight);
+        int height = sourceHeight - top - (int)Math.Floor(sourceHeight * recipe.CropBottom);
         if (width <= 0 || height <= 0) throw new ArgumentException("Recipe crop leaves no pixels.");
         return (left, top, width, height);
     }

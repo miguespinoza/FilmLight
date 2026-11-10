@@ -92,8 +92,6 @@ public sealed class NativeCamera : INativeCamera
         // with UNSUPPORTED/UNKNOWN (both FATAL), so drive mode S is the still single-shot check.
         if (GetValue("XSDK_GetDriveMode") != 4)
             throw new CameraSdkException("Set the camera to still mode with the drive dial on S (single shot).");
-        if (GetProperty(0x2202) != 1)
-            throw new CameraSdkException("Set the focus selector to M. Manual focus avoids focus changes between RGB exposures.");
         if (GetProperty(0x2130) != quality)
             throw new CameraSdkException("Image quality changed. Disconnect and reconnect to reconfigure transfers.");
         if (quality != 1 && GetProperty(0x219F) != 7)
@@ -129,7 +127,7 @@ public sealed class NativeCamera : INativeCamera
         var shots = 1;
         Check(Release(0x10000, ref shots, out var af), "HalfPress");
         if (af == 0)
-            throw new CameraSdkException("Camera rejected the half-press. Check manual focus and exposure settings.");
+            throw new CameraSdkException("Camera rejected the half-press. Check the camera's focus/release priority and exposure settings.");
     }
 
     public void FullPress()

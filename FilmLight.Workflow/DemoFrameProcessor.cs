@@ -11,58 +11,53 @@ namespace FilmLight.Workflow;
 [SupportedOSPlatform("windows")]
 public sealed class DemoFrameProcessor : IFrameProcessor
 {
+    private readonly FrameSources? sources;
+
+    public DemoFrameProcessor() { }
+    internal DemoFrameProcessor(FrameSources sources) => this.sources = sources;
+
     public async Task<PreviewResult> PreviewAsync(RollDocument roll, RollCapture frame, DevelopRecipe recipe,
         string workDirectory, IProgress<ProcessingProgress>? progress, CancellationToken cancellationToken)
     {
-        var result = await ProcessAsync(roll, frame, recipe, workDirectory, progress, cancellationToken, true).ConfigureAwait(false);
-        return new(result.OutputFiles[1], result.Warnings,
-            Path.Combine(Path.GetDirectoryName(result.OutputFiles[1])!, "source-preview.jpg"));
+        var result = await ProcessAsync(roll, frame, recipe, workDirectory, progress, cancellationToken, DevelopIntent.Preview).ConfigureAwait(false);
+        return new(result.OutputFiles[0], result.Warnings,
+            Path.Combine(Path.GetDirectoryName(result.OutputFiles[0])!, "source-preview.jpg"));
     }
 
     public Task<FrameProcessingResult> ExportAsync(RollDocument roll, RollCapture frame, DevelopRecipe recipe,
         string outputDirectory, IProgress<ProcessingProgress>? progress, CancellationToken cancellationToken)
     {
-        recipe.PictureCalibration?.RequireComplete(recipe.FilmKind);
-        return ProcessAsync(roll, frame, recipe, outputDirectory, progress, cancellationToken);
+        if (!recipe.FrameId.HasValue) recipe.PictureCalibration?.RequireComplete(recipe.FilmKind);
+        return ProcessAsync(roll, frame, recipe, outputDirectory, progress, cancellationToken, DevelopIntent.Export);
     }
 
-    private static Task<FrameProcessingResult> ProcessAsync(RollDocument roll, RollCapture frame, DevelopRecipe recipe,
-        string directory, IProgress<ProcessingProgress>? progress, CancellationToken token, bool forPreview = false)
+    private Task<FrameProcessingResult> ProcessAsync(RollDocument roll, RollCapture frame, DevelopRecipe recipe,
+        string directory, IProgress<ProcessingProgress>? progress, CancellationToken token, DevelopIntent intent)
     {
         // Validate provenance before creating a job, even when callers accidentally choose the demo processor.
         if (!roll.IsDemo || !frame.IsDemo)
             throw new InvalidOperationException("DemoFrameProcessor rejects non-demo rolls and inputs; it is not a fallback for darktable.");
-        string[] warnings = [ProcessingImages.SyntheticLabel, "Simplified synthetic renderer; no real-camera, film-color or darktable validation."];
-        return ProcessingPublication.RunAsync(directory, frame, recipe, true, warnings,
-            staging => Task.Run(() =>
+        var warnings = new List<string>
+        {
+            ProcessingImages.SyntheticLabel, "Simplified synthetic renderer; no real-camera, film-color or darktable validation."
+        };
+        if (recipe.PictureCalibration?.Light?.IsClipped == true)
+            warnings.Add(PictureCalibration.ClippedBacklightWarning);
+        if (recipe.PictureCalibration is { } picture && !picture.IsComplete(recipe.FilmKind))
+            warnings.Add("Uncalibrated/provisional output for this frame. Auto-pick again or use its manual pickers.");
+        return ProcessingPublication.RunAsync(directory, frame, recipe, true, warnings, intent,
+            async staging =>
             {
+                using var ownedSources = sources is null ? new FrameSources(Path.Combine(directory, "camera-input-cache"), null) : null;
                 progress?.Report(new(frame.Id, "Rendering synthetic positive", "Applying roll settings to the simulated input."));
-                var reconstruction = ReferenceReconstruction.Reconstruct(roll, frame, recipe, true, token);
-                var image = forPreview ? ProcessingImages.CropForPreview(reconstruction.Image, recipe, token) : reconstruction.Image;
-                var controls = forPreview ? recipe with { CropLeft = 0, CropTop = 0, CropRight = 0, CropBottom = 0 } : recipe;
-                if (forPreview) ProcessingImages.WriteSourcePreview(Path.Combine(staging, "source-preview.jpg"), image, controls, token);
-                if (recipe.FilmKind != FilmKind.Positive)
-                {
-                    for (int i = 0; i < image.Pixels.Length; i++)
-                    {
-                        if ((i & 65535) == 0) token.ThrowIfCancellationRequested();
-                        double baseValue = reconstruction.FilmBase[i % 3];
-                        image.Pixels[i] = (float)Math.Clamp(Math.Log10(baseValue / Math.Max(image.Pixels[i], 1e-10)) / 1.6, 0, 1);
-                    }
-                    if (recipe.FilmKind == FilmKind.BlackAndWhiteNegative)
-                        for (int i = 0; i < image.Pixels.Length; i += 3)
-                        {
-                            if ((i & 65535) == 0) token.ThrowIfCancellationRequested();
-                            float gray = (image.Pixels[i] + image.Pixels[i + 1] + image.Pixels[i + 2]) / 3;
-                            image.Pixels[i] = image.Pixels[i + 1] = image.Pixels[i + 2] = gray;
-                        }
-                }
-                return ReferenceReconstruction.ApplyControls(image, controls, token);
-            }, token),
-            (_, image, tiff, jpeg) => Task.Run(() =>
-            {
-                ProcessingImages.WriteTiff(tiff, image, false, ProcessingImages.SyntheticLabel, token);
-                ProcessingImages.WriteJpeg(jpeg, image, token);
-            }, token), progress, token);
+                var context = new DevelopContext(roll, frame, recipe, intent, sources ?? ownedSources!, staging, progress);
+                var result = await DevelopPipeline.RunAsync(Steps(intent), context,
+                    new(new(0, 0, []), [1, 1, 1], recipe), token).ConfigureAwait(false);
+                return result.Image;
+            }, progress, token);
     }
+
+    private static IReadOnlyList<IDevelopStep> Steps(DevelopIntent intent) => intent == DevelopIntent.Preview
+        ? [new ReconstructStep(true), new PreviewCropStep(), new DemoInversionStep(), new DevelopControlsStep(), new PreviewEncodeStep()]
+        : [new ReconstructStep(true), new DemoInversionStep(), new DevelopControlsStep(), new DemoExportEncodeStep()];
 }

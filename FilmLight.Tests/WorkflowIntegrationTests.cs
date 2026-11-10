@@ -20,7 +20,6 @@ public sealed class WorkflowIntegrationTests : IDisposable
     {
         var store = RollStore.Create(Path.Combine(directory, "roll"), "Synthetic acceptance roll", filmKind, true);
         IWorkflowCaptureSource source = new DemoCaptureSource();
-        IFrameProcessor processor = new DemoFrameProcessor();
         var shown = new List<LightChannel>();
         store.SetPhase(WorkflowPhase.Capture);
         await Capture(CapturePurpose.Frame);
@@ -36,53 +35,53 @@ public sealed class WorkflowIntegrationTests : IDisposable
 
         store.SetPhase(WorkflowPhase.Develop);
         var representative = store.Document.Captures.First(c => c.Purpose == CapturePurpose.Frame);
-        var draft = new DevelopRecipe { FilmKind = filmKind, PictureCalibration = new() };
-        Assert.Throws<InvalidOperationException>(() => store.SaveRecipe(draft, accept: true));
-        var preview = await processor.PreviewAsync(store.Document, representative, draft,
-            Path.Combine(directory, "preview"), null, CancellationToken.None);
-        Assert.True(File.Exists(preview.ImagePath));
-        Assert.True(new FileInfo(preview.ImagePath).Length > 100);
-        Assert.NotNull(preview.SourceImagePath);
-        draft = await FrameCalibration.SampleAsync(store.Document, representative, draft, CalibrationTarget.Backlight,
-            3.0 / 384, .5, directory, null, default);
+        using var workflow = new FrameWorkflow(store, null);
+        var preview = await workflow.PreviewAsync(representative.Id, null, default);
+        Assert.True(File.Exists(preview.PositivePath));
+        Assert.True(new FileInfo(preview.PositivePath).Length > 100);
+        Assert.NotNull(preview.SourcePath);
+        preview = await workflow.PickAsync(representative.Id, CalibrationTarget.Backlight,
+            3.0 / 384, .5, null, default);
         if (filmKind != FilmKind.Positive)
         {
-            Assert.Throws<InvalidOperationException>(() => store.SaveRecipe(draft, accept: true));
-            draft = await FrameCalibration.SampleAsync(store.Document, representative, draft, CalibrationTarget.FilmBase,
-                12.0 / 384, .5, directory, null, default);
+            preview = await workflow.PickAsync(representative.Id, CalibrationTarget.FilmBase,
+                12.0 / 384, .5, null, default);
         }
-        preview = await processor.PreviewAsync(store.Document, representative, draft,
-            Path.Combine(directory, "picked-preview"), null, CancellationToken.None);
         Assert.Empty(store.Document.Exports);
-        var accepted = store.SaveRecipe(draft, accept: true);
+        var accepted = workflow.AcceptedRecipe(representative.Id)!;
         store.SetPhase(WorkflowPhase.Export);
 
+        var summary = await workflow.ExportAsync(store.Document.Captures.Select(c => c.Id).ToArray(), null, default);
+        Assert.Equal(2, summary.Completed);
+        Assert.Equal(0, summary.Failed);
         foreach (var frame in store.Document.Captures.Where(c => c.Purpose == CapturePurpose.Frame))
         {
-            var result = await processor.ExportAsync(store.Document, frame, accepted,
-                Path.Combine(store.RootPath, "exports", $"frame-{frame.Number}"), null, CancellationToken.None);
+            var local = workflow.AcceptedRecipe(frame.Id)!;
+            Assert.Equal(frame.Id, local.FrameId);
+            Assert.Equal(frame.Id, local.PictureCalibration!.Light!.FrameId);
+            var result = store.Document.Exports.Last(e => e.FrameId == frame.Id);
             Assert.Contains(result.OutputFiles, p => Path.GetExtension(p).Equals(".tif", StringComparison.OrdinalIgnoreCase)
                 || Path.GetExtension(p).Equals(".tiff", StringComparison.OrdinalIgnoreCase));
             Assert.Contains(result.OutputFiles, p => Path.GetExtension(p).Equals(".jpg", StringComparison.OrdinalIgnoreCase)
                 || Path.GetExtension(p).Equals(".jpeg", StringComparison.OrdinalIgnoreCase));
             Assert.All(result.OutputFiles, p => Assert.True(new FileInfo(p).Length > 100));
-            store.RecordExport(new(frame.Id, accepted.Id, accepted.Revision, ExportState.Complete,
-                result.OutputFiles, null, DateTimeOffset.UtcNow));
         }
 
         var reopened = RollStore.Open(store.RootPath);
-        Assert.Equal(accepted.PictureCalibration, reopened.Document.Recipes.Last().PictureCalibration);
+        Assert.Equal(accepted, reopened.Document.Recipes.Last(r => r.FrameId == representative.Id && r.Accepted));
+        Assert.Equal(2, reopened.Document.Recipes.Select(r => r.FrameId).Distinct().Count());
         Assert.Equal(WorkflowPhase.Export, reopened.Document.Phase);
         Assert.Equal(2, reopened.Document.Exports.Count(e => e.State == ExportState.Complete));
         Assert.All(originals, pair => Assert.Equal(pair.Value, Hash(pair.Key)));
 
-        var edited = accepted with { ExposureEv = 1 };
-        var changed = await processor.PreviewAsync(reopened.Document, representative, edited,
-            Path.Combine(directory, "edited-preview"), null, CancellationToken.None);
-        Assert.NotEqual(Hash(preview.ImagePath), Hash(changed.ImagePath));
-        var revision = reopened.SaveRecipe(edited, accept: true);
-        Assert.Equal(accepted.Revision + 1, revision.Revision);
-        Assert.All(reopened.Document.Exports, e => Assert.Equal(accepted.Revision, e.RecipeRevision));
+        using var resumed = new FrameWorkflow(reopened, null);
+        var edited = resumed.Edit(representative.Id, resumed.Draft(representative.Id) with { ExposureEv = 1 });
+        var changed = await resumed.PreviewAsync(representative.Id, null, default);
+        Assert.NotEqual(Hash(preview.PositivePath), Hash(changed.PositivePath));
+        var revision = resumed.Accept(changed);
+        Assert.Equal(edited.Revision + 1, revision.Revision);
+        Assert.All(reopened.Document.Exports, e => Assert.Contains(reopened.Document.Recipes,
+            recipe => recipe.FrameId == e.FrameId && recipe.Id == e.RecipeId && recipe.Revision == e.RecipeRevision));
 
         async Task Capture(CapturePurpose purpose)
         {

@@ -118,6 +118,8 @@ public sealed class RollStore
             var current = Read();
             if (draft.FilmKind != current.FilmKind)
                 throw new ArgumentException("Recipe film kind must match the roll.", nameof(draft));
+            if (current.Recipes.Any(r => r.Id == draft.Id && r.FrameId != draft.FrameId))
+                throw new InvalidOperationException("A recipe's frame cannot change. Create a separate recipe for the other frame.");
             if (accept)
                 RequireCalibration(current, draft);
             var revision = checked(current.Recipes.Where(r => r.Id == draft.Id)
@@ -205,7 +207,7 @@ public sealed class RollStore
                     RequireProperties<CaptureFile>(file);
             }
             foreach (var recipe in json.RootElement.GetProperty(nameof(RollDocument.Recipes)).EnumerateArray())
-                RequireProperties<DevelopRecipe>(recipe, nameof(DevelopRecipe.PictureCalibration));
+                RequireProperties<DevelopRecipe>(recipe, nameof(DevelopRecipe.PictureCalibration), nameof(DevelopRecipe.FrameId));
             foreach (var export in json.RootElement.GetProperty(nameof(RollDocument.Exports)).EnumerateArray())
                 RequireProperties<FrameExport>(export);
             var result = json.RootElement.Deserialize<RollDocument>(JsonOptions)
@@ -220,14 +222,14 @@ public sealed class RollStore
         }
     }
 
-    private static void RequireProperties<T>(JsonElement element, string? optionalProperty = null)
+    private static void RequireProperties<T>(JsonElement element, params string[] optionalProperties)
     {
         if (element.ValueKind != JsonValueKind.Object)
             throw new InvalidDataException($"Expected a {typeof(T).Name} object.");
         var names = element.EnumerateObject().Select(p => p.Name).ToArray();
         var expected = typeof(T).GetProperties().Select(p => p.Name).ToArray();
         if (names.Except(expected, StringComparer.Ordinal).Any() || names.Distinct(StringComparer.Ordinal).Count() != names.Length
-            || expected.Any(name => name != optionalProperty && !element.TryGetProperty(name, out _)))
+            || expected.Any(name => !optionalProperties.Contains(name, StringComparer.Ordinal) && !element.TryGetProperty(name, out _)))
             throw new InvalidDataException($"Incomplete or unexpected {typeof(T).Name} properties.");
     }
 
@@ -265,7 +267,9 @@ public sealed class RollStore
             if (recipe is null)
                 throw new InvalidDataException("Null recipe.");
             ValidateRecipeValues(recipe);
-            recipe.PictureCalibration?.Validate(roll);
+            if (recipe.FrameId is { } frameId && !roll.Captures.Any(c => c.Id == frameId && c.Purpose == CapturePurpose.Frame))
+                throw new InvalidDataException("A frame recipe must identify a captured picture in this roll.");
+            recipe.PictureCalibration?.Validate(roll, frameId: recipe.FrameId);
             if (recipe.FilmKind != roll.FilmKind
                 || recipe.Revision != checked(revisions.GetValueOrDefault(recipe.Id) + 1)
                 || recipe.Accepted != recipe.AcceptedAt.HasValue
@@ -294,7 +298,8 @@ public sealed class RollStore
         CheckEnum(export.State, nameof(export.State));
         if (!roll.Captures.Any(c => c.Id == export.FrameId && c.Purpose == CapturePurpose.Frame))
             throw new InvalidDataException("Export must identify a captured frame.");
-        if (!roll.Recipes.Any(r => r.Id == export.RecipeId && r.Revision == export.RecipeRevision && r.Accepted))
+        if (!roll.Recipes.Any(r => r.Id == export.RecipeId && r.Revision == export.RecipeRevision && r.Accepted
+            && (!r.FrameId.HasValue || r.FrameId == export.FrameId)))
             throw new InvalidDataException("Export must identify an accepted recipe revision.");
         if (export.UpdatedAt == default || export.OutputFiles is null)
             throw new InvalidDataException("Export timestamp and output list are required.");
@@ -334,6 +339,15 @@ public sealed class RollStore
 
     private static void RequireCalibration(RollDocument roll, DevelopRecipe recipe)
     {
+        if (recipe.FrameId is { } frameId)
+        {
+            var frame = roll.Captures.SingleOrDefault(c => c.Id == frameId && c.Purpose == CapturePurpose.Frame)
+                ?? throw new InvalidOperationException("The recipe must belong to a captured frame.");
+            if (recipe.PictureCalibration is not { } local)
+                throw new InvalidOperationException("Prepare this frame's automatic calibration before accepting it.");
+            local.Validate(roll, frame.Mode, frame.Id);
+            return;
+        }
         if (recipe.PictureCalibration is not { } picture)
         {
             RequireReferences(roll);
@@ -364,13 +378,13 @@ public sealed class RollStore
 
     private static void ValidateRecipeValues(DevelopRecipe recipe)
     {
-        recipe.PictureCalibration?.Light?.Validate();
+        recipe.PictureCalibration?.Light?.Validate(allowClipped: true);
         recipe.PictureCalibration?.FilmBase?.Validate();
         CheckEnum(recipe.FilmKind, nameof(recipe.FilmKind));
         double[] positive = [recipe.RedGain, recipe.GreenGain, recipe.BlueGain,
             recipe.FilmBaseRed, recipe.FilmBaseGreen, recipe.FilmBaseBlue];
         double[] margins = [recipe.CropLeft, recipe.CropTop, recipe.CropRight, recipe.CropBottom];
-        if (recipe.Id == Guid.Empty || !double.IsFinite(recipe.ExposureEv)
+        if (recipe.Id == Guid.Empty || recipe.FrameId == Guid.Empty || !double.IsFinite(recipe.ExposureEv)
             || positive.Any(value => !double.IsFinite(value) || value <= 0)
             || margins.Any(value => !double.IsFinite(value) || value < 0 || value >= 1)
             || recipe.CropLeft + recipe.CropRight >= 1 || recipe.CropTop + recipe.CropBottom >= 1

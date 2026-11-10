@@ -466,7 +466,7 @@ public sealed class MainWindow : Window
         panel.Children.Add(new TextBlock
         {
             TextWrapping = TextWrapping.Wrap,
-            Text = "Connect the X-T5 by USB in USB TETHER SHOOTING AUTO mode. Set M focus and S drive. Choose shutter speed, aperture, ISO and white balance on the camera; Film Light uses camera-priority triggering and never sets exposure values. Keep settings fixed within each RGB set.\n\nSelect RAW, JPEG or RAW+JPEG on the camera (not HEIF). Use a writable card and close other tether apps. Photos download automatically; existing queued images are preserved in Recovery. Do not press the camera shutter during app captures."
+            Text = "Connect the X-T5 by USB in USB TETHER SHOOTING AUTO mode. Set S drive. Autofocus or manual focus is your choice; Film Light leaves focus mode unchanged. Choose shutter speed, aperture, ISO and white balance on the camera; Film Light uses camera-priority triggering and never sets exposure values. Each frame has its own calibration. RGB channels are captured as one set.\n\nSelect RAW, JPEG or RAW+JPEG on the camera (not HEIF). Use a writable card and close other tether apps. Photos download automatically; existing queued images are preserved in Recovery. Do not press the camera shutter during app captures."
         });
         var sdkPath = new TextBlock { Text = settings.SdkPath, TextWrapping = TextWrapping.Wrap, FontSize = 13 };
         var outputPath = new TextBlock { Text = settings.OutputPath, TextWrapping = TextWrapping.Wrap, FontSize = 13 };

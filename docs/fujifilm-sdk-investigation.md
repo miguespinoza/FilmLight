@@ -170,6 +170,13 @@ Fujifilm's prescribed completion evidence is polling `GetBufferCapacity` or `Rea
 
 “Ready” also is not one universal bit. Priority, shooting/playback, mode, drive, focus, buffer capacity and camera busy state are different dimensions. Check `GetMode` and `GetDriveMode`, and physically select still/single mode where necessary: mechanical dials/switches override software, `SetDriveMode`/`SetMode` cannot override certain mechanical selections, and some `GetDriveMode` responses are coarse compatibility values. A helper's application `Ready` state must therefore include verified configuration, queue ownership and no unresolved prior shot, not just a nonbusy getter. [M pp.43–44 §§1.6–1.7; pp.114–123 §§4.1.6.4–4.1.6.9]
 
+**Implementation update, 2026-11-09:** Focus mode belongs to the user. Film Light
+does not require M, set a focus mode, or restore a different mode on disconnect.
+AF-S, AF-C and manual selection remain on the camera. A half-press rejected by the
+camera still reports its failure; the app does not override the body's focus/release
+priority. Roll processing now calibrates each frame from its own sprockets and film
+base rather than requiring exposure/focus to stay fixed across the roll.
+
 **Hardware finding, 2026-11-05 (X-T5, USB tether, camera priority):** `XSDK_GetMode` fails with `XSDK_ERRCODE_UNKNOWN` (0x9100) or `XSDK_ERRCODE_UNSUPPORTED` (0x1005), both FATAL, even though priority, quality, release and drive-mode getters succeed. On bodies without a mode dial movie is categorized in DRIVE MODE (M p.43 §1.6; `XT5_DRIVE_MODE_MOVIE` in `X-T5.h`), and Fujifilm's ZoomPos sample checks `GetDriveMode` first. Film Light therefore requires `GetDriveMode == XSDK_DRIVE_MODE_S` and does not call `GetMode`.
 
 `XSDK_GetErrorDetails` is a **busy-error diagnostic**, called after `GetErrorNumber` reports `RUNNING_OTHER_FUNCTION`; its flags include shooting, self-timer, live view, recording and untransferred images. Do not promote it to an unconditional readiness/exposure-event API. [M p.101 §4.1.4.2; H lines 2251–2261]

@@ -14,17 +14,30 @@ public sealed record RollCapture(Guid Id, int Number, CapturePurpose Purpose, Ca
 
 public sealed record PictureSample(Guid FrameId, double X, double Y, double Red, double Green, double Blue)
 {
-    internal void Validate()
+    // Nonzero dimensions identify full-capture coordinates; legacy picks could be crop-relative.
+    public int SourceWidth { get; init; }
+    public int SourceHeight { get; init; }
+    public bool IsClipped { get; init; }
+
+    internal void Validate(bool allowClipped = false)
     {
+        if (IsClipped && !allowClipped)
+            throw new ArgumentException("Only a backlight pick may be saved as clipped; clipped film-base picks are not usable.");
+        if ((SourceWidth != 0 || SourceHeight != 0)
+            && (SourceWidth <= 0 || SourceHeight <= 0 || (long)SourceWidth * SourceHeight > 60_000_000))
+            throw new ArgumentException("Sample positions require valid original capture dimensions.");
         if (FrameId == Guid.Empty || !double.IsFinite(X) || !double.IsFinite(Y)
             || X < 0 || X >= 1 || Y < 0 || Y >= 1
-            || new[] { Red, Green, Blue }.Any(v => !double.IsFinite(v) || v <= .0001 || v >= .99999))
+            || new[] { Red, Green, Blue }.Any(v => !double.IsFinite(v) || v <= .0001 || (!IsClipped && v >= .99999)))
             throw new ArgumentException("Pick an unclipped, evenly lit patch inside the image, away from dark holder edges.");
     }
 }
 
 public sealed record PictureCalibration
 {
+    internal const string ClippedBacklightWarning =
+        "Clipped backlight pick saved as a marker only; no backlight normalization or white-balance correction is applied.";
+
     public PictureSample? Light { get; init; }
     public PictureSample? FilmBase { get; init; }
 
@@ -33,14 +46,17 @@ public sealed record PictureCalibration
     internal void RequireComplete(FilmKind filmKind)
     {
         if (!IsComplete(filmKind))
-            throw new InvalidOperationException("Pick exposed light and, for negatives, clear film in a captured picture before exporting the roll.");
+            throw new InvalidOperationException("This frame needs exposed light and, for negatives, clear film samples.");
     }
 
-    internal void Validate(RollDocument roll, CaptureMode? mode = null)
+    internal void Validate(RollDocument roll, CaptureMode? mode = null, Guid? frameId = null)
     {
+        Light?.Validate(allowClipped: true);
+        FilmBase?.Validate();
         foreach (var sample in new[] { Light, FilmBase }.OfType<PictureSample>())
         {
-            sample.Validate();
+            if (frameId.HasValue && sample.FrameId != frameId)
+                throw new InvalidOperationException("Calibration samples must come from this frame, not another picture in the roll.");
             if (!roll.Captures.Any(c => c.Id == sample.FrameId && c.Purpose == CapturePurpose.Frame
                 && c.IsDemo == roll.IsDemo && (!mode.HasValue || c.Mode == mode)))
                 throw new InvalidOperationException("Picture samples must come from a captured frame in this roll with the same capture mode.");
@@ -70,6 +86,23 @@ public sealed record DevelopRecipe
     public bool Accepted { get; init; }
     public DateTimeOffset? AcceptedAt { get; init; }
     public PictureCalibration? PictureCalibration { get; init; }
+    public Guid? FrameId { get; init; }
+
+    public DevelopRecipe ForFrame(Guid frameId)
+    {
+        if (frameId == Guid.Empty) throw new ArgumentException("A captured frame identity is required.", nameof(frameId));
+        if (FrameId == frameId) return this;
+        var local = PictureCalibration;
+        if (FrameId.HasValue || local is null || (local.Light is null && local.FilmBase is null)
+            || (local.Light is { } light && light.FrameId != frameId)
+            || (local.FilmBase is { } basis && basis.FrameId != frameId))
+            local = null;
+        return this with
+        {
+            Id = Guid.NewGuid(), Revision = 1, FrameId = frameId, PictureCalibration = local,
+            Accepted = false, AcceptedAt = null
+        };
+    }
 }
 
 public sealed record FrameExport(Guid FrameId, Guid RecipeId, int RecipeRevision,
