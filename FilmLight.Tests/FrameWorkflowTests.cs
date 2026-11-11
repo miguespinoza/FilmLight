@@ -10,7 +10,7 @@ public sealed class FrameWorkflowTests : IDisposable
     private readonly string directory = Path.Combine(Path.GetTempPath(), "FilmLight-frame-workflow-" + Guid.NewGuid().ToString("N"));
 
     [Fact]
-    public async Task ControlsEditedBeforeTheFirstCaptureAreRestoredAndUsedForItsDraft()
+    public async Task FramesStartFromDefaultsRatherThanRollWideSettings()
     {
         var store = RollStore.Create(Path.Combine(directory, "roll"), "Defaults", FilmKind.ColorNegative, true);
         using (var workflow = new FrameWorkflow(store, null))
@@ -22,7 +22,7 @@ public sealed class FrameWorkflowTests : IDisposable
             Path.Combine(directory, "incoming"), (_, _) => Task.CompletedTask, default);
         var frame = store.AddCapture(CapturePurpose.Frame, CaptureMode.White, files, true);
         var preview = await resumed.PreviewAsync(frame.Id, null, default);
-        Assert.Equal(.5, preview.Recipe.ExposureEv);
+        Assert.Equal(0, preview.Recipe.ExposureEv);
         Assert.Equal(frame.Id, preview.Recipe.FrameId);
         Assert.True(preview.PicksReady);
     }
@@ -52,7 +52,7 @@ public sealed class FrameWorkflowTests : IDisposable
     }
 
     [Fact]
-    public async Task PreviewCanBeAcceptedOnlyOnceAndKeepsItsExactSnapshot()
+    public async Task PreviewKeepsItsExactSnapshotWhenSettingsChange()
     {
         var (store, frames) = await Roll();
         using var workflow = new FrameWorkflow(store, null);
@@ -62,69 +62,15 @@ public sealed class FrameWorkflowTests : IDisposable
         Assert.True(File.Exists(preview.PositivePath));
         Assert.True(File.Exists(preview.SourcePath));
         Assert.Contains(preview.Warnings, w => w.Contains("SYNTHETIC"));
-        Assert.False(preview.Recipe.Accepted);
-        var accepted = workflow.Accept(preview);
-        Assert.True(accepted.Accepted);
-        Assert.Equal(preview.Recipe.PictureCalibration, accepted.PictureCalibration);
-        Assert.Equal(accepted.Revision, workflow.Draft(frames[0].Id).Revision);
-        Assert.False(workflow.Draft(frames[0].Id).Accepted);
-        Assert.Throws<InvalidOperationException>(() => workflow.Accept(preview));
-        Assert.False(preview.Recipe.Accepted);
+        var saved = workflow.Edit(frames[0].Id, preview.Recipe with { ExposureEv = 1 });
+        Assert.Equal(0, preview.Recipe.ExposureEv);
+        Assert.Equal(1, saved.ExposureEv);
+        Assert.Equal(saved, store.Document.Recipes.Last());
+        Assert.Equal(saved, workflow.Draft(frames[0].Id));
     }
 
     [Fact]
-    public async Task AcceptanceRejectsEditedRecipeEvenIfControlsAreRestored()
-    {
-        var (store, frames) = await Roll();
-        using var workflow = new FrameWorkflow(store, null);
-        var preview = await workflow.PreviewAsync(frames[0].Id, null, default);
-        workflow.Edit(frames[0].Id, preview.Recipe with { ExposureEv = 1 });
-        Assert.Equal("Render a successful preview of this exact recipe and selected frame first.",
-            Assert.Throws<InvalidOperationException>(() => workflow.Accept(preview)).Message);
-        workflow.Edit(frames[0].Id, preview.Recipe);
-        Assert.Throws<InvalidOperationException>(() => workflow.Accept(preview));
-        Assert.DoesNotContain(store.Document.Recipes, r => r.Accepted);
-        workflow.Accept(await workflow.PreviewAsync(frames[0].Id, null, default));
-    }
-
-    [Fact]
-    public async Task AcceptanceRejectsAnotherFrameOrWorkflowAndSupersededPreview()
-    {
-        var (store, frames) = await Roll(2);
-        using var workflow = new FrameWorkflow(store, null);
-        using var other = new FrameWorkflow(store, null);
-        var first = await workflow.PreviewAsync(frames[0].Id, null, default);
-        Assert.Throws<InvalidOperationException>(() => other.Accept(first));
-        var wrongFrame = new FramePreview(frames[1].Id, first.Recipe, first.XmpHash, first.PositivePath,
-            first.SourcePath, first.Warnings, first.Message);
-        Assert.Throws<InvalidOperationException>(() => workflow.Accept(wrongFrame));
-        var latest = await workflow.PreviewAsync(frames[0].Id, null, default);
-        Assert.Throws<InvalidOperationException>(() => workflow.Accept(first));
-        workflow.Accept(latest);
-        Assert.Equal(frames[0].Id, Assert.Single(store.Document.Recipes, r => r.Accepted).FrameId);
-    }
-
-    [Fact]
-    public async Task AcceptanceRechecksThePreviewedXmpAndInvalidatesItOnChange()
-    {
-        var (store, frames) = await Roll();
-        using var workflow = new FrameWorkflow(store, null);
-        var xmp = Path.Combine(directory, "import.xmp");
-        File.WriteAllText(xmp, "<xmp>first</xmp>");
-        workflow.Edit(frames[0].Id, workflow.Draft(frames[0].Id) with { XmpTemplatePath = xmp });
-        var preview = await workflow.PreviewAsync(frames[0].Id, null, default);
-        var owned = preview.Recipe.XmpTemplatePath!;
-        Assert.NotNull(preview.XmpHash);
-        File.WriteAllText(owned, "<xmp>changed</xmp>");
-        Assert.Equal("The imported XMP changed since preview. Render it again before acceptance.",
-            Assert.Throws<InvalidOperationException>(() => workflow.Accept(preview)).Message);
-        File.WriteAllText(owned, "<xmp>first</xmp>");
-        Assert.Throws<InvalidOperationException>(() => workflow.Accept(preview));
-        Assert.DoesNotContain(store.Document.Recipes, r => r.Accepted);
-    }
-
-    [Fact]
-    public async Task XmpChangedDuringRenderingDoesNotIssueAnAcceptablePreview()
+    public async Task XmpChangedDuringRenderingDoesNotIssueAPreview()
     {
         var (store, frames) = await Roll();
         using var workflow = new FrameWorkflow(store, null);
@@ -139,30 +85,30 @@ public sealed class FrameWorkflowTests : IDisposable
         Assert.Equal("The imported XMP changed during preview. Import a stable calibrated XMP and render again.",
             (await Assert.ThrowsAsync<InvalidDataException>(() =>
                 workflow.PreviewAsync(frames[0].Id, progress, default))).Message);
-        Assert.Null(workflow.AcceptedRecipe(frames[0].Id));
     }
 
     [Fact]
-    public async Task UnacceptedExportUsesApprovedControlsNotTheFramesUnacceptedDraft()
+    public async Task ExportUsesEachFramesLatestOverrideWithoutPreview()
     {
         var (store, frames) = await Roll(2);
         using var workflow = new FrameWorkflow(store, null);
         workflow.Edit(frames[0].Id, workflow.Draft(frames[0].Id) with { ExposureEv = .75, RedGain = 1.1 });
-        var approved = workflow.Accept(await workflow.PreviewAsync(frames[0].Id, null, default));
+        var first = workflow.Draft(frames[0].Id);
         workflow.Edit(frames[1].Id, workflow.Draft(frames[1].Id) with { ExposureEv = -2 });
         var updates = new List<ExportProgress>();
         var summary = await workflow.ExportAsync([frames[1].Id], null, default, new Callback<ExportProgress>(updates.Add));
         Assert.Equal(1, summary.Completed);
         Assert.Equal(0, summary.Failed);
-        var local = workflow.AcceptedRecipe(frames[1].Id)!;
-        Assert.Equal(approved.ExposureEv, local.ExposureEv);
-        Assert.Equal(approved.RedGain, local.RedGain);
-        Assert.NotEqual(approved.Id, local.Id);
+        var local = workflow.Draft(frames[1].Id);
+        Assert.Equal(-2, local.ExposureEv);
+        Assert.Equal(1.1, local.RedGain);
+        Assert.NotEqual(first.Id, local.Id);
+        Assert.Equal(first, workflow.Draft(frames[0].Id));
         Assert.Equal(frames[1].Id, local.PictureCalibration!.Light!.FrameId);
         Assert.Equal(frames[1].Id, local.PictureCalibration.FilmBase!.FrameId);
         Assert.Equal(local.PictureCalibration, workflow.Draft(frames[1].Id).PictureCalibration);
-        Assert.Equal("Batch finished: 1/1 complete, 0 failed. Each frame used its own accepted calibration/settings. Inputs retained; retry missing/failed jobs explicitly.", summary.Message);
-        Assert.Contains(updates, p => p.Context == $"Batch: 0/1 complete, 0 failed. Exporting frame 2 with accepted revision {local.Revision}.");
+        Assert.Equal("Batch finished: 1/1 complete, 0 failed. Each frame used its own latest saved calibration/settings. Inputs retained; retry missing/failed jobs explicitly.", summary.Message);
+        Assert.Contains(updates, p => p.Context == $"Batch: 0/1 complete, 0 failed. Exporting frame 2 with saved revision {local.Revision}.");
         var complete = store.Document.Exports.Last();
         Assert.Equal(ExportState.Complete, complete.State);
         Assert.All(complete.OutputFiles, p =>
@@ -181,7 +127,7 @@ public sealed class FrameWorkflowTests : IDisposable
     {
         var (store, frames) = await Roll();
         using var workflow = new FrameWorkflow(store, null);
-        workflow.Accept(await workflow.PreviewAsync(frames[0].Id, null, default));
+        await workflow.PreviewAsync(frames[0].Id, null, default);
         await workflow.ExportAsync([frames[0].Id], null, default);
         var first = store.Document.Exports.Last();
         var records = store.Document.Exports.Count;
@@ -204,6 +150,82 @@ public sealed class FrameWorkflowTests : IDisposable
     }
 
     [Fact]
+    public async Task ExportAfterReopeningUsesLatestEditsRatherThanAnOlderExportedRevision()
+    {
+        var (store, frames) = await Roll(2);
+        DevelopRecipe changed;
+        using (var workflow = new FrameWorkflow(store, null))
+        {
+            workflow.Edit(frames[1].Id, workflow.Draft(frames[1].Id) with { ExposureEv = -.25 });
+            var first = await workflow.ExportAsync(frames.Select(f => f.Id).ToArray(), null, default);
+            Assert.Equal(2, first.Completed);
+            changed = workflow.Edit(frames[0].Id, workflow.Draft(frames[0].Id) with
+            {
+                ExposureEv = 1.5, RedGain = 1.2
+            });
+        }
+        var reopened = RollStore.Open(store.RootPath);
+        var secondFrame = reopened.Document.Recipes.Last(r => r.FrameId == frames[1].Id);
+        var earlier = reopened.Document.Exports.Last(e => e.FrameId == frames[0].Id);
+        using var resumed = new FrameWorkflow(reopened, null);
+        var result = await resumed.ExportAsync(frames.Select(f => f.Id).ToArray(), null, default);
+        Assert.Equal(2, result.Completed);
+        Assert.Equal(0, result.Failed);
+        var exported = reopened.Document.Exports.Last(e => e.FrameId == frames[0].Id);
+        Assert.Equal(changed.Revision, exported.RecipeRevision);
+        Assert.NotEqual(earlier.OutputFiles, exported.OutputFiles);
+        Assert.Equal(changed, resumed.Draft(frames[0].Id));
+        Assert.Equal(secondFrame, resumed.Draft(frames[1].Id));
+        Assert.Single(reopened.Document.Exports, e => e.FrameId == frames[1].Id && e.State == ExportState.Complete);
+    }
+
+    [Fact]
+    public async Task UneditedFramesFollowPreviousSiblingUntilControlsAreOverriddenAndKeepTheirOwnPicks()
+    {
+        var (store, frames) = await Roll(3);
+        var xmp = Path.Combine(directory, "inherited.xmp");
+        File.WriteAllText(xmp, "<xmp>inherited controls</xmp>");
+        using (var workflow = new FrameWorkflow(store, null))
+        {
+            workflow.Edit(frames[0].Id, workflow.Draft(frames[0].Id) with
+            {
+                ExposureEv = .5, RedGain = 1.1, XmpTemplatePath = xmp
+            });
+            // Resolve out of order: inheritance follows frame numbering, not the last selection.
+            Assert.Equal(.5, workflow.Draft(frames[2].Id).ExposureEv);
+            await workflow.PreviewAsync(frames[1].Id, null, default);
+            Assert.True(workflow.Draft(frames[1].Id).InheritControls);
+            Assert.Equal("<xmp>inherited controls</xmp>", File.ReadAllText(workflow.Draft(frames[1].Id).XmpTemplatePath!));
+            var picks = workflow.Draft(frames[1].Id).PictureCalibration;
+            Assert.Equal(frames[1].Id, picks!.Light!.FrameId);
+            workflow.Edit(frames[0].Id, workflow.Draft(frames[0].Id) with { ExposureEv = 1 });
+            var inherited = workflow.Draft(frames[1].Id);
+            Assert.Equal(1, inherited.ExposureEv);
+            Assert.Equal(1, workflow.Draft(frames[2].Id).ExposureEv);
+            Assert.Equal(picks, inherited.PictureCalibration);
+            workflow.Edit(frames[1].Id, inherited with { ExposureEv = -.5 });
+            workflow.Edit(frames[0].Id, workflow.Draft(frames[0].Id) with { ExposureEv = 2 });
+            Assert.Equal(-.5, workflow.Draft(frames[1].Id).ExposureEv);
+            Assert.Equal(-.5, workflow.Draft(frames[2].Id).ExposureEv);
+            Assert.Null(workflow.Draft(frames[2].Id).PictureCalibration);
+            var result = await workflow.ExportAsync(frames.Select(f => f.Id).ToArray(), null, default);
+            Assert.Equal(3, result.Completed);
+        }
+        var reopened = RollStore.Open(store.RootPath);
+        using var resumed = new FrameWorkflow(reopened, null);
+        Assert.False(resumed.Draft(frames[1].Id).InheritControls);
+        Assert.True(resumed.Draft(frames[2].Id).InheritControls);
+        resumed.Edit(frames[1].Id, resumed.Draft(frames[1].Id) with { BlueGain = 1.3 });
+        Assert.Equal(1.3, resumed.Draft(frames[2].Id).BlueGain);
+        var exported = await resumed.ExportAsync([frames[2].Id], null, default);
+        Assert.Equal(1, exported.Completed);
+        Assert.Equal(frames[2].Id, resumed.Draft(frames[2].Id).PictureCalibration!.Light!.FrameId);
+        var records = reopened.Document.Exports.Count;
+        await resumed.ExportAsync([frames[2].Id], null, default);
+        Assert.Equal(records, reopened.Document.Exports.Count);
+    }
+
+    [Fact]
     public async Task WorkflowRetainsOneProcessorAndSourcesUntilDisposal()
     {
         var (store, frames) = await Roll(2);
@@ -221,7 +243,7 @@ public sealed class FrameWorkflowTests : IDisposable
             var firstSources = owned;
             Assert.Same(firstSources, workflow.Sources);
             workflow.Edit(frames[0].Id, workflow.Draft(frames[0].Id) with { ExposureEv = .5 });
-            workflow.Accept(await workflow.PreviewAsync(frames[0].Id, null, default));
+            await workflow.PreviewAsync(frames[0].Id, null, default);
             Assert.Same(firstSources, workflow.Sources);
             await workflow.PreviewAsync(frames[1].Id, null, default);
             await workflow.ExportAsync([frames[0].Id], null, default);
@@ -243,7 +265,7 @@ public sealed class FrameWorkflowTests : IDisposable
     {
         var (store, frames) = await Roll();
         using var workflow = new FrameWorkflow(store, null);
-        workflow.Accept(await workflow.PreviewAsync(frames[0].Id, null, default));
+        await workflow.PreviewAsync(frames[0].Id, null, default);
         using var cancel = new CancellationTokenSource();
         var processing = new Callback<ProcessingProgress>(p =>
         {
@@ -267,7 +289,7 @@ public sealed class FrameWorkflowTests : IDisposable
     {
         var (store, frames) = await Roll();
         using var workflow = new FrameWorkflow(store, null);
-        workflow.Accept(await workflow.PreviewAsync(frames[0].Id, null, default));
+        await workflow.PreviewAsync(frames[0].Id, null, default);
         using var cancel = new CancellationTokenSource();
         cancel.Cancel();
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
@@ -280,7 +302,7 @@ public sealed class FrameWorkflowTests : IDisposable
     {
         var (store, frames) = await Roll(2);
         using var workflow = new FrameWorkflow(store, null, sources => new InvalidFirstExportProcessor(sources));
-        workflow.Accept(await workflow.PreviewAsync(frames[0].Id, null, default));
+        await workflow.PreviewAsync(frames[0].Id, null, default);
         var summary = await workflow.ExportAsync(frames.Select(f => f.Id).ToArray(), null, default);
         Assert.Equal(1, summary.Completed);
         Assert.Equal(1, summary.Failed);
@@ -292,28 +314,25 @@ public sealed class FrameWorkflowTests : IDisposable
     }
 
     [Fact]
-    public async Task AutoPickRemainsUnacceptedWhileManualPickAutoAcceptsAndKeepsPreview()
+    public async Task AutomaticAndManualPicksSaveOnlyToTheirOwnFrameAndKeepPreview()
     {
         var (store, frames) = await Roll(2);
         using var workflow = new FrameWorkflow(store, null);
         var automatic = await workflow.AutoPickAsync(frames[0].Id, null, default);
         Assert.True(automatic.PicksReady);
         Assert.Contains("Automatic picks from frame 1 (linear RGB):", automatic.SamplingMessage);
-        Assert.Null(workflow.AcceptedRecipe(frames[0].Id));
+        Assert.Equal(automatic.Recipe, store.Document.Recipes.Last());
         var manual = await workflow.PickAsync(frames[0].Id, CalibrationTarget.Backlight, 3.0 / 384, .5, null, default);
         Assert.True(manual.PicksReady);
         Assert.Equal("Preview rendered for the exact current recipe. Light and film picks are applied to this frame only.", manual.Message);
-        var accepted = workflow.AcceptedRecipe(frames[0].Id)!;
-        Assert.Equal(accepted.PictureCalibration, manual.Recipe.PictureCalibration);
+        Assert.Equal(store.Document.Recipes.Last().PictureCalibration, manual.Recipe.PictureCalibration);
         Assert.Equal(workflow.Draft(frames[0].Id), manual.Recipe);
-        Assert.False(manual.Recipe.Accepted);
-        workflow.Accept(manual);
-        Assert.Null(workflow.AcceptedRecipe(frames[1].Id));
+        Assert.DoesNotContain(store.Document.Recipes, r => r.FrameId == frames[1].Id);
         Assert.Null(workflow.Draft(frames[1].Id).PictureCalibration);
     }
 
     [Fact]
-    public async Task FailedDetectionCanBePreviewedAndAcceptedWithProvisionalWarnings()
+    public async Task FailedDetectionCanBePreviewedAndExportedWithProvisionalWarnings()
     {
         var (store, frames) = await Roll();
         var file = frames[0].Files[0].Path;
@@ -326,14 +345,13 @@ public sealed class FrameWorkflowTests : IDisposable
         Assert.Contains(preview.Warnings, w => w.StartsWith("Automatic calibration failed for frame 1:"));
         Assert.Contains(preview.Warnings, w => w.StartsWith("Uncalibrated/provisional output"));
         Assert.Contains("This frame is uncalibrated.", preview.Message);
-        workflow.Accept(preview);
         var summary = await workflow.ExportAsync([frames[0].Id], null, default);
         Assert.Equal(1, summary.Completed);
         Assert.Contains(summary.Warnings, w => w.Contains("Uncalibrated/provisional output"));
     }
 
     [Fact]
-    public async Task ClippedManualBacklightIsAutoAcceptedAsMarkerOnlyAndPreviewIsKept()
+    public async Task ClippedManualBacklightIsSavedAsMarkerOnlyAndPreviewIsKept()
     {
         var (store, frames) = await Roll();
         var file = frames[0].Files[0].Path;
@@ -346,7 +364,7 @@ public sealed class FrameWorkflowTests : IDisposable
         using var workflow = new FrameWorkflow(store, null);
         var incomplete = await workflow.PickAsync(frames[0].Id, CalibrationTarget.FilmBase, 12.0 / 384, .5, null, default);
         Assert.False(incomplete.PicksReady);
-        Assert.Null(workflow.AcceptedRecipe(frames[0].Id));
+        Assert.Equal(incomplete.Recipe, store.Document.Recipes.Last());
         var preview = await workflow.PickAsync(frames[0].Id, CalibrationTarget.Backlight, 3.0 / 384, .5, null, default);
         Assert.True(preview.PicksReady);
         Assert.True(preview.Recipe.PictureCalibration!.Light!.IsClipped);
@@ -354,8 +372,7 @@ public sealed class FrameWorkflowTests : IDisposable
         Assert.Equal("Preview rendered for the exact current recipe. Picks saved for this frame only; clipped backlight is marker-only, with WB correction skipped.",
             preview.Message);
         Assert.Contains(PictureCalibration.ClippedBacklightWarning, preview.Warnings);
-        Assert.Equal(workflow.AcceptedRecipe(frames[0].Id)!.PictureCalibration, preview.Recipe.PictureCalibration);
-        workflow.Accept(preview);
+        Assert.Equal(store.Document.Recipes.Last().PictureCalibration, preview.Recipe.PictureCalibration);
     }
 
     [Fact]

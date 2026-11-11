@@ -18,7 +18,7 @@ public sealed class WorkflowIntegrationTests : IDisposable
     [InlineData(CaptureMode.White, FilmKind.Positive)]
     public async Task SimulatedRollCanBeCapturedReviewedExportedAndReopenedWithoutChangingInputs(CaptureMode mode, FilmKind filmKind)
     {
-        var store = RollStore.Create(Path.Combine(directory, "roll"), "Synthetic acceptance roll", filmKind, true);
+        var store = RollStore.Create(Path.Combine(directory, "roll"), "Synthetic frame settings roll", filmKind, true);
         IWorkflowCaptureSource source = new DemoCaptureSource();
         var shown = new List<LightChannel>();
         store.SetPhase(WorkflowPhase.Capture);
@@ -48,7 +48,7 @@ public sealed class WorkflowIntegrationTests : IDisposable
                 12.0 / 384, .5, null, default);
         }
         Assert.Empty(store.Document.Exports);
-        var accepted = workflow.AcceptedRecipe(representative.Id)!;
+        var saved = workflow.Draft(representative.Id);
         store.SetPhase(WorkflowPhase.Export);
 
         var summary = await workflow.ExportAsync(store.Document.Captures.Select(c => c.Id).ToArray(), null, default);
@@ -56,7 +56,7 @@ public sealed class WorkflowIntegrationTests : IDisposable
         Assert.Equal(0, summary.Failed);
         foreach (var frame in store.Document.Captures.Where(c => c.Purpose == CapturePurpose.Frame))
         {
-            var local = workflow.AcceptedRecipe(frame.Id)!;
+            var local = workflow.Draft(frame.Id);
             Assert.Equal(frame.Id, local.FrameId);
             Assert.Equal(frame.Id, local.PictureCalibration!.Light!.FrameId);
             var result = store.Document.Exports.Last(e => e.FrameId == frame.Id);
@@ -68,7 +68,7 @@ public sealed class WorkflowIntegrationTests : IDisposable
         }
 
         var reopened = RollStore.Open(store.RootPath);
-        Assert.Equal(accepted, reopened.Document.Recipes.Last(r => r.FrameId == representative.Id && r.Accepted));
+        Assert.Equal(saved, reopened.Document.Recipes.Last(r => r.FrameId == representative.Id));
         Assert.Equal(2, reopened.Document.Recipes.Select(r => r.FrameId).Distinct().Count());
         Assert.Equal(WorkflowPhase.Export, reopened.Document.Phase);
         Assert.Equal(2, reopened.Document.Exports.Count(e => e.State == ExportState.Complete));
@@ -78,8 +78,9 @@ public sealed class WorkflowIntegrationTests : IDisposable
         var edited = resumed.Edit(representative.Id, resumed.Draft(representative.Id) with { ExposureEv = 1 });
         var changed = await resumed.PreviewAsync(representative.Id, null, default);
         Assert.NotEqual(Hash(preview.PositivePath), Hash(changed.PositivePath));
-        var revision = resumed.Accept(changed);
-        Assert.Equal(edited.Revision + 1, revision.Revision);
+        Assert.Equal(edited, changed.Recipe);
+        await resumed.ExportAsync([representative.Id], null, default);
+        Assert.Equal(edited.Revision, reopened.Document.Exports.Last().RecipeRevision);
         Assert.All(reopened.Document.Exports, e => Assert.Contains(reopened.Document.Recipes,
             recipe => recipe.FrameId == e.FrameId && recipe.Id == e.RecipeId && recipe.Revision == e.RecipeRevision));
 

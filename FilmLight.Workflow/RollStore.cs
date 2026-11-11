@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 using FilmLight.Core;
 
@@ -108,7 +109,7 @@ public sealed class RollStore
     /// Appends a revision, never changing a saved revision. Crops are normalized edge margins;
     /// black/white points are normalized levels. XMP templates are copied, not linked.
     /// </summary>
-    public DevelopRecipe SaveRecipe(DevelopRecipe draft, bool accept)
+    public DevelopRecipe SaveRecipe(DevelopRecipe draft)
     {
         ArgumentNullException.ThrowIfNull(draft);
         ValidateRecipeValues(draft);
@@ -120,8 +121,6 @@ public sealed class RollStore
                 throw new ArgumentException("Recipe film kind must match the roll.", nameof(draft));
             if (current.Recipes.Any(r => r.Id == draft.Id && r.FrameId != draft.FrameId))
                 throw new InvalidOperationException("A recipe's frame cannot change. Create a separate recipe for the other frame.");
-            if (accept)
-                RequireCalibration(current, draft);
             var revision = checked(current.Recipes.Where(r => r.Id == draft.Id)
                 .Select(r => r.Revision).DefaultIfEmpty(0).Max() + 1);
             var xmp = draft.XmpTemplatePath is null ? null
@@ -130,14 +129,11 @@ public sealed class RollStore
             var saved = draft with
             {
                 Revision = revision,
-                XmpTemplatePath = xmp,
-                Accepted = accept,
-                AcceptedAt = accept ? DateTimeOffset.UtcNow : null
+                XmpTemplatePath = xmp
             };
             Commit(current with
             {
-                Recipes = [.. current.Recipes, saved],
-                AcceptedRecipeId = accept ? saved.Id : current.AcceptedRecipeId
+                Recipes = [.. current.Recipes, saved]
             });
             return saved;
         }
@@ -199,7 +195,9 @@ public sealed class RollStore
         {
             using var stream = File.OpenRead(LocalPath(ManifestPath));
             using var json = JsonDocument.Parse(stream);
-            RequireProperties<RollDocument>(json.RootElement, nameof(RollDocument.CreatedAt));
+            var legacy = json.RootElement.GetProperty(nameof(RollDocument.SchemaVersion)).GetInt32() == 1;
+            RequireProperties<RollDocument>(json.RootElement, legacy
+                ? [nameof(RollDocument.CreatedAt), "AcceptedRecipeId"] : [nameof(RollDocument.CreatedAt)]);
             foreach (var capture in json.RootElement.GetProperty(nameof(RollDocument.Captures)).EnumerateArray())
             {
                 RequireProperties<RollCapture>(capture);
@@ -207,10 +205,26 @@ public sealed class RollStore
                     RequireProperties<CaptureFile>(file);
             }
             foreach (var recipe in json.RootElement.GetProperty(nameof(RollDocument.Recipes)).EnumerateArray())
-                RequireProperties<DevelopRecipe>(recipe, nameof(DevelopRecipe.PictureCalibration), nameof(DevelopRecipe.FrameId));
+                RequireProperties<DevelopRecipe>(recipe, legacy
+                    ? [nameof(DevelopRecipe.PictureCalibration), nameof(DevelopRecipe.FrameId), "Accepted", "AcceptedAt",
+                        nameof(DevelopRecipe.InheritControls), nameof(DevelopRecipe.ControlsSourceRecipeId), nameof(DevelopRecipe.ControlsSourceRevision)]
+                    : [nameof(DevelopRecipe.PictureCalibration), nameof(DevelopRecipe.FrameId),
+                        nameof(DevelopRecipe.InheritControls), nameof(DevelopRecipe.ControlsSourceRecipeId), nameof(DevelopRecipe.ControlsSourceRevision)]);
             foreach (var export in json.RootElement.GetProperty(nameof(RollDocument.Exports)).EnumerateArray())
                 RequireProperties<FrameExport>(export);
-            var result = json.RootElement.Deserialize<RollDocument>(JsonOptions)
+            // Version 1 approval metadata has no meaning in the per-frame, latest-settings workflow.
+            var manifest = JsonNode.Parse(json.RootElement.GetRawText())!.AsObject();
+            if (legacy)
+            {
+                manifest[nameof(RollDocument.SchemaVersion)] = 2;
+                manifest.Remove("AcceptedRecipeId");
+                foreach (var recipe in manifest[nameof(RollDocument.Recipes)]!.AsArray())
+                {
+                    recipe!.AsObject().Remove("Accepted");
+                    recipe.AsObject().Remove("AcceptedAt");
+                }
+            }
+            var result = manifest.Deserialize<RollDocument>(JsonOptions)
                 ?? throw new InvalidDataException("Roll manifest is null.");
             ValidateDocument(result);
             return result;
@@ -228,14 +242,14 @@ public sealed class RollStore
             throw new InvalidDataException($"Expected a {typeof(T).Name} object.");
         var names = element.EnumerateObject().Select(p => p.Name).ToArray();
         var expected = typeof(T).GetProperties().Select(p => p.Name).ToArray();
-        if (names.Except(expected, StringComparer.Ordinal).Any() || names.Distinct(StringComparer.Ordinal).Count() != names.Length
+        if (names.Except(expected.Concat(optionalProperties), StringComparer.Ordinal).Any() || names.Distinct(StringComparer.Ordinal).Count() != names.Length
             || expected.Any(name => !optionalProperties.Contains(name, StringComparer.Ordinal) && !element.TryGetProperty(name, out _)))
             throw new InvalidDataException($"Incomplete or unexpected {typeof(T).Name} properties.");
     }
 
     private void ValidateDocument(RollDocument roll)
     {
-        if (roll.SchemaVersion != 1 || roll.Id == Guid.Empty || string.IsNullOrWhiteSpace(roll.Name)
+        if (roll.SchemaVersion != 2 || roll.Id == Guid.Empty || string.IsNullOrWhiteSpace(roll.Name)
             || roll.Captures is null || roll.Recipes is null || roll.Exports is null || roll.IntermediatesTrashed)
             throw new InvalidDataException("Unsupported or incomplete roll manifest.");
         CheckEnum(roll.FilmKind, nameof(roll.FilmKind));
@@ -271,19 +285,12 @@ public sealed class RollStore
                 throw new InvalidDataException("A frame recipe must identify a captured picture in this roll.");
             recipe.PictureCalibration?.Validate(roll, frameId: recipe.FrameId);
             if (recipe.FilmKind != roll.FilmKind
-                || recipe.Revision != checked(revisions.GetValueOrDefault(recipe.Id) + 1)
-                || recipe.Accepted != recipe.AcceptedAt.HasValue
-                || recipe.AcceptedAt == default(DateTimeOffset))
-                throw new InvalidDataException("Invalid recipe revision or acceptance.");
+                || recipe.Revision != checked(revisions.GetValueOrDefault(recipe.Id) + 1))
+                throw new InvalidDataException("Invalid recipe revision.");
             revisions[recipe.Id] = recipe.Revision;
             if (recipe.XmpTemplatePath is not null)
                 RequireFile(OwnedPath(recipe.XmpTemplatePath, "recipes"));
-            if (recipe.Accepted)
-                RequireCalibration(roll, recipe);
         }
-        var latestAccepted = roll.Recipes.LastOrDefault(r => r.Accepted);
-        if (roll.AcceptedRecipeId != latestAccepted?.Id)
-            throw new InvalidDataException("Accepted recipe pointer does not match the saved acceptance.");
         ValidatePhase(roll, roll.Phase);
         foreach (var export in roll.Exports)
         {
@@ -298,9 +305,9 @@ public sealed class RollStore
         CheckEnum(export.State, nameof(export.State));
         if (!roll.Captures.Any(c => c.Id == export.FrameId && c.Purpose == CapturePurpose.Frame))
             throw new InvalidDataException("Export must identify a captured frame.");
-        if (!roll.Recipes.Any(r => r.Id == export.RecipeId && r.Revision == export.RecipeRevision && r.Accepted
-            && (!r.FrameId.HasValue || r.FrameId == export.FrameId)))
-            throw new InvalidDataException("Export must identify an accepted recipe revision.");
+        if (!roll.Recipes.Any(r => r.Id == export.RecipeId && r.Revision == export.RecipeRevision
+            && (r.FrameId == export.FrameId || (!requireOutputs && !r.FrameId.HasValue))))
+            throw new InvalidDataException("Export must identify a saved recipe revision for this frame.");
         if (export.UpdatedAt == default || export.OutputFiles is null)
             throw new InvalidDataException("Export timestamp and output list are required.");
         if (export.State is ExportState.Failed or ExportState.Canceled && string.IsNullOrWhiteSpace(export.Error))
@@ -326,54 +333,9 @@ public sealed class RollStore
 
     private static void ValidatePhase(RollDocument roll, WorkflowPhase phase)
     {
-        if (phase == WorkflowPhase.Develop && !roll.Captures.Any(c => c.Purpose == CapturePurpose.Frame))
-            throw new InvalidOperationException("Develop requires captured frames.");
-        if (phase == WorkflowPhase.Export)
-        {
-            var accepted = roll.Recipes.LastOrDefault(r => r.Accepted && r.Id == roll.AcceptedRecipeId);
-            if (accepted is null)
-                throw new InvalidOperationException("Export requires an accepted recipe.");
-            RequireCalibration(roll, accepted);
-        }
-    }
-
-    private static void RequireCalibration(RollDocument roll, DevelopRecipe recipe)
-    {
-        if (recipe.FrameId is { } frameId)
-        {
-            var frame = roll.Captures.SingleOrDefault(c => c.Id == frameId && c.Purpose == CapturePurpose.Frame)
-                ?? throw new InvalidOperationException("The recipe must belong to a captured frame.");
-            if (recipe.PictureCalibration is not { } local)
-                throw new InvalidOperationException("Prepare this frame's automatic calibration before accepting it.");
-            local.Validate(roll, frame.Mode, frame.Id);
-            return;
-        }
-        if (recipe.PictureCalibration is not { } picture)
-        {
-            RequireReferences(roll);
-            return;
-        }
-        picture.Validate(roll);
-        picture.RequireComplete(recipe.FilmKind);
-        var frames = roll.Captures.Where(c => c.Purpose == CapturePurpose.Frame).ToArray();
-        if (frames.Length == 0)
-            throw new InvalidOperationException("Applying a recipe requires a captured picture.");
-        foreach (var frame in frames) picture.Validate(roll, frame.Mode);
-    }
-
-    private static void RequireReferences(RollDocument roll)
-    {
-        var modes = roll.Captures.Where(c => c.Purpose == CapturePurpose.Frame).Select(c => c.Mode).Distinct().ToArray();
-        if (modes.Length == 0)
-            throw new InvalidOperationException("Accepting a recipe requires captured frames.");
-        foreach (var mode in modes)
-        {
-            if (!roll.Captures.Any(c => c.Purpose == CapturePurpose.LightReference && c.Mode == mode))
-                throw new InvalidOperationException($"A {mode} light reference is required.");
-            if (roll.FilmKind != FilmKind.Positive
-                && !roll.Captures.Any(c => c.Purpose == CapturePurpose.FilmBaseReference && c.Mode == mode))
-                throw new InvalidOperationException($"A {mode} clear-film/base reference is required for negative film.");
-        }
+        if (phase is WorkflowPhase.Develop or WorkflowPhase.Export
+            && !roll.Captures.Any(c => c.Purpose == CapturePurpose.Frame))
+            throw new InvalidOperationException($"{phase} requires captured frames.");
     }
 
     private static void ValidateRecipeValues(DevelopRecipe recipe)
@@ -384,7 +346,11 @@ public sealed class RollStore
         double[] positive = [recipe.RedGain, recipe.GreenGain, recipe.BlueGain,
             recipe.FilmBaseRed, recipe.FilmBaseGreen, recipe.FilmBaseBlue];
         double[] margins = [recipe.CropLeft, recipe.CropTop, recipe.CropRight, recipe.CropBottom];
-        if (recipe.Id == Guid.Empty || recipe.FrameId == Guid.Empty || !double.IsFinite(recipe.ExposureEv)
+        if (recipe.Id == Guid.Empty || recipe.FrameId == Guid.Empty
+            || recipe.ControlsSourceRecipeId == Guid.Empty || recipe.ControlsSourceRevision < 0
+            || recipe.ControlsSourceRecipeId.HasValue != (recipe.ControlsSourceRevision > 0)
+            || (!recipe.InheritControls && recipe.ControlsSourceRecipeId.HasValue)
+            || !double.IsFinite(recipe.ExposureEv)
             || positive.Any(value => !double.IsFinite(value) || value <= 0)
             || margins.Any(value => !double.IsFinite(value) || value < 0 || value >= 1)
             || recipe.CropLeft + recipe.CropRight >= 1 || recipe.CropTop + recipe.CropBottom >= 1

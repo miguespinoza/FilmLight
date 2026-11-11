@@ -151,7 +151,7 @@ public sealed class ProcessingTests : IDisposable
         Assert.True(FrameCalibration.TryMapSample(light, frame.Id, changed, 384, 256, 384, 256, out var x, out var y));
         Assert.Equal(3, x, 5);
         Assert.Equal(128, y, 5);
-        var accepted = store.SaveRecipe(changed, true);
+        var accepted = store.SaveRecipe(changed);
         var reopened = RollStore.Open(store.RootPath);
         Assert.Equal(accepted, Assert.Single(reopened.Document.Recipes));
         using var sources = new FrameSources(Path.Combine(root, "camera-input-cache"), null);
@@ -234,7 +234,7 @@ public sealed class ProcessingTests : IDisposable
         {
             FrameId = frame.Id, FilmKind = roll.FilmKind, PictureCalibration = new(), CropLeft = .2, CropTop = .2,
             CropRight = .2, CropBottom = .2, ExposureEv = .5, RedGain = 1.1, BlueGain = .9,
-            FilmBaseRed = 1.1, Accepted = true, AcceptedAt = DateTimeOffset.UtcNow
+            FilmBaseRed = 1.1
         };
         var changed = await FrameCalibration.AutoSampleAsync(roll, frame, recipe, root, null, default);
         var light = Assert.IsType<PictureSample>(changed.PictureCalibration!.Light);
@@ -252,7 +252,7 @@ public sealed class ProcessingTests : IDisposable
         Assert.Equal(.25, basis.Green, 5);
         Assert.Equal(.1, basis.Blue, 5);
         Assert.True(vertical ? light.X < .2 || light.X > .8 : light.Y < .2 || light.Y > .8);
-        Assert.Equal(recipe with { PictureCalibration = changed.PictureCalibration, Accepted = false, AcceptedAt = null }, changed);
+        Assert.Equal(recipe with { PictureCalibration = changed.PictureCalibration }, changed);
         using var sources = new FrameSources(Path.Combine(root, "camera-input-cache"), null);
         var reconstructed = await ReferenceReconstruction.ReconstructAsync(sources, roll, frame, changed, true, FrameSources.FullResolution, default);
         Assert.Equal(.5 / .8 * recipe.FilmBaseRed, reconstructed.FilmBase[0], 5);
@@ -264,7 +264,6 @@ public sealed class ProcessingTests : IDisposable
     [Theory]
     [InlineData("missing")]
     [InlineData("two")]
-    [InlineData("clipped")]
     [InlineData("conflicting")]
     [InlineData("uneven")]
     [InlineData("no-film")]
@@ -278,8 +277,33 @@ public sealed class ProcessingTests : IDisposable
         Assert.Contains("manual pickers", error.Message);
     }
 
+    [Theory]
+    [InlineData(1f)]
+    [InlineData(1.004f)]
+    public async Task AutomaticClippedBacklightUsesTheSameMarkerOnlyBehaviorAsManualPicking(float peak)
+    {
+        var frame = await Capture(CapturePurpose.Frame, CaptureMode.White, 1);
+        var image = PerforatedFilm(false, "clipped");
+        for (int i = 0; i < image.Pixels.Length; i += 3)
+            if (image.Pixels[i] == 1) image.Pixels[i] = peak;
+        ProcessingImages.WriteTiff(frame.Files[0].Path, image, true,
+            ProcessingImages.SyntheticLabel + "; " + ProcessingImages.LinearLabel, default,
+            ProcessingImages.LinearRec2020Profile());
+        var roll = new RollDocument { IsDemo = true, Captures = [frame] };
+        var recipe = new DevelopRecipe { FrameId = frame.Id };
+        var manual = await FrameCalibration.SampleAsync(roll, frame, recipe,
+            CalibrationTarget.Backlight, 44.0 / 384, 29.0 / 256, root, null, default);
+        Assert.True(manual.PictureCalibration!.Light!.IsClipped);
+        var automatic = await FrameCalibration.AutoSampleAsync(roll, frame, recipe, root, null, default);
+        Assert.True(automatic.PictureCalibration!.IsComplete(roll.FilmKind));
+        Assert.True(automatic.PictureCalibration.Light!.IsClipped);
+        Assert.False(automatic.PictureCalibration.FilmBase!.IsClipped);
+        var output = await new DemoFrameProcessor().PreviewAsync(roll, frame, automatic, root, null, default);
+        Assert.Contains(PictureCalibration.ClippedBacklightWarning, output.Warnings);
+    }
+
     [Fact]
-    public void AutoPicksExplainOutOfRangeBacklightRatherThanClaimingHolesWereNotDetected()
+    public void AutoPicksRetainOutOfRangeBacklightAsMarkerOnly()
     {
         var image = PerforatedFilm(false);
         for (int i = 0; i < image.Pixels.Length; i += 3)
@@ -289,16 +313,12 @@ public sealed class ProcessingTests : IDisposable
                 image.Pixels[i + 1] = 1.01f;
                 image.Pixels[i + 2] = .9f;
             }
-        var error = Assert.Throws<InvalidDataException>(() =>
-            SprocketCalibration.Detect(image, Guid.NewGuid(), true, default));
-        Assert.Contains("Detected", error.Message);
-        Assert.Contains("backlight", error.Message, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("exposure", error.Message);
-        Assert.DoesNotContain("No reliable, evenly spaced sprocket row", error.Message);
+        var picture = SprocketCalibration.Detect(image, Guid.NewGuid(), true, default);
+        Assert.True(picture.Light!.IsClipped);
+        Assert.NotNull(picture.FilmBase);
     }
 
     [Theory]
-    [InlineData("clipped", "Backlight")]
     [InlineData("marked-film", "FilmBase")]
     public async Task RejectedAutoPicksSaveMeasurementDiagnosticsWithoutChangingExistingPicks(string problem, string target)
     {
@@ -311,7 +331,7 @@ public sealed class ProcessingTests : IDisposable
         {
             Light = new(frame.Id, .1, .1, .8, .7, .6), FilmBase = new(frame.Id, .2, .1, .5, .25, .1)
         };
-        var recipe = new DevelopRecipe { FilmKind = roll.FilmKind, PictureCalibration = picture, Accepted = true };
+        var recipe = new DevelopRecipe { FilmKind = roll.FilmKind, PictureCalibration = picture };
         var error = await Assert.ThrowsAsync<InvalidDataException>(() =>
             FrameCalibration.AutoSampleAsync(roll, frame, recipe, root, null, default));
         string logPath = Assert.Single(Directory.GetFiles(Path.Combine(root, "calibration-diagnostics"), "*.log"));
@@ -324,7 +344,6 @@ public sealed class ProcessingTests : IDisposable
         Assert.Contains("RGB median=", log);
         Assert.Contains("Result: rejected", log);
         Assert.Same(picture, recipe.PictureCalibration);
-        Assert.True(recipe.Accepted);
     }
 
     [Fact]
@@ -341,12 +360,11 @@ public sealed class ProcessingTests : IDisposable
         };
         var recipe = new DevelopRecipe
         {
-            FilmKind = roll.FilmKind, PictureCalibration = picture, Accepted = true, AcceptedAt = DateTimeOffset.UtcNow
+            FilmKind = roll.FilmKind, PictureCalibration = picture
         };
         await Assert.ThrowsAsync<InvalidDataException>(() =>
             FrameCalibration.AutoSampleAsync(roll, frame, recipe, root, null, default));
         Assert.Same(picture, recipe.PictureCalibration);
-        Assert.True(recipe.Accepted);
         using var cancel = new CancellationTokenSource();
         cancel.Cancel();
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
@@ -413,7 +431,6 @@ public sealed class ProcessingTests : IDisposable
         Assert.Equal(.1 / .6, BitConverter.ToSingle(parameters, 12), 5);
         Assert.Contains("negadoctor", File.ReadAllText(Path.Combine(job, "develop.stdout.log")));
         Assert.True(File.Exists(preview.ImagePath));
-        Assert.False(recipe.Accepted);
     }
 
     [Fact]
@@ -438,7 +455,7 @@ public sealed class ProcessingTests : IDisposable
         var locations = SprocketCalibration.Locate(image, default);
         Assert.True(locations.LightY < .2 || locations.LightY > .8);
         Assert.NotEqual(locations.LightX, locations.FilmBaseX);
-        Assert.Throws<InvalidDataException>(() => SprocketCalibration.Detect(image, Guid.NewGuid(), true, default));
+        Assert.True(SprocketCalibration.Detect(image, Guid.NewGuid(), true, default).Light!.IsClipped);
     }
 
     [Fact]
@@ -489,10 +506,8 @@ public sealed class ProcessingTests : IDisposable
         var recipe = new DevelopRecipe { FrameId = frame.Id };
         if (hiddenClipping)
         {
-            var error = await Assert.ThrowsAsync<InvalidDataException>(() =>
-                FrameCalibration.AutoSampleAsync(sources, roll, frame, recipe, root, default, progress));
-            Assert.Contains("Reduce camera exposure and recapture", error.Message);
-            Assert.Contains("Diagnostics:", error.Message);
+            var result = await FrameCalibration.AutoSampleAsync(sources, roll, frame, recipe, root, default, progress);
+            Assert.True(result.PictureCalibration!.Light!.IsClipped);
             Assert.Equal(2, progress.Events.Count(p => p.Stage == "Reading linear input"));
         }
         else
@@ -768,7 +783,6 @@ public sealed class ProcessingTests : IDisposable
         Assert.Equal(recipe.RedGain, changed.RedGain);
         Assert.Equal(recipe.GreenGain, changed.GreenGain);
         Assert.Equal(recipe.BlueGain, changed.BlueGain);
-        Assert.False(changed.Accepted);
         Assert.Equal(recipe.FilmBaseRed, changed.FilmBaseRed);
     }
 
@@ -798,7 +812,6 @@ public sealed class ProcessingTests : IDisposable
         var repeated = await FrameCalibration.SampleAsync(roll, frame, changed,
             CalibrationTarget.FilmBase, .3, .4, root, null, default);
         Assert.Equal(changed, repeated);
-        Assert.False(changed.Accepted);
         Assert.Equal(recipe.RedGain, changed.RedGain);
     }
 
@@ -1305,7 +1318,7 @@ public sealed class ProcessingTests : IDisposable
         var basis = await Capture(CapturePurpose.FilmBaseReference, mode, 0);
         var frame = await Capture(CapturePurpose.Frame, mode, 7);
         return (new RollDocument { IsDemo = true, FilmKind = FilmKind.ColorNegative, Captures = [light, basis, frame] },
-            frame, new DevelopRecipe { FilmKind = FilmKind.ColorNegative, Accepted = true });
+            frame, new DevelopRecipe { FilmKind = FilmKind.ColorNegative });
     }
 
     private async Task<RollCapture> Capture(CapturePurpose purpose, CaptureMode mode, int number)

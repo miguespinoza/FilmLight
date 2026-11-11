@@ -212,6 +212,21 @@ public sealed class FrameSourceTests : IDisposable
         Assert.Contains(result.Warnings, w => w.Contains("Provisional"));
     }
 
+    [RawFact("FILMLIGHT_TEST_SPROCKET_RAF")]
+    public async Task RealSprocketsWithOutOfRangeBacklightStillProduceFrameLocalMarkerAndFilmBase()
+    {
+        var frame = Capture(CapturePurpose.Frame, Environment.GetEnvironmentVariable("FILMLIGHT_TEST_SPROCKET_RAF")!,
+            DateTimeOffset.UtcNow);
+        var roll = new RollDocument { FilmKind = FilmKind.ColorNegative, Captures = [frame] };
+        var recipe = await FrameCalibration.AutoSampleAsync(roll, frame,
+            new() { FilmKind = roll.FilmKind, FrameId = frame.Id }, root, Cli, default);
+        Assert.True(recipe.PictureCalibration!.IsComplete(roll.FilmKind));
+        Assert.True(recipe.PictureCalibration.Light!.IsClipped);
+        Assert.Equal(frame.Id, recipe.PictureCalibration.Light.FrameId);
+        Assert.Equal(frame.Id, recipe.PictureCalibration.FilmBase!.FrameId);
+        Assert.False(recipe.PictureCalibration.FilmBase.IsClipped);
+    }
+
     [RawFact("FILMLIGHT_TEST_RAF")]
     public async Task RealRafPairPrefersRawCachesByContentAndPreservesOriginals()
     {
@@ -656,7 +671,7 @@ public sealed class FrameSourceTests : IDisposable
         var crop = UsableCrop(decoded);
         var recipe = new DevelopRecipe
         {
-            FilmKind = FilmKind.ColorNegative, Accepted = true,
+            FilmKind = FilmKind.ColorNegative,
             CropLeft = crop.Left, CropTop = crop.Top, CropRight = crop.Right, CropBottom = crop.Bottom
         };
         var result = await new DarktableFrameProcessor(Cli, root).ExportAsync(roll, captures[2], recipe,

@@ -170,7 +170,7 @@ internal static class ReferenceReconstruction
         DevelopRecipe Checked(DevelopRecipe changed)
         {
             ValidateRecipe(changed);
-            return changed with { Accepted = false, AcceptedAt = null };
+            return changed;
         }
 
         double[] Average(LinearImage image)

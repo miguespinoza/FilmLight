@@ -28,7 +28,7 @@ public static class FrameCalibration
         }
         catch (InvalidDataException error)
         {
-            return (local with { PictureCalibration = new(), Accepted = false, AcceptedAt = null },
+            return (local with { PictureCalibration = new() },
                 $"Automatic calibration failed for frame {frame.Number}: {error.Message} " +
                 "Showing an uncalibrated preview. Auto-pick again or use this frame's manual pickers.");
         }
@@ -68,7 +68,7 @@ public static class FrameCalibration
             var state = await CalibrationPipeline.RunAsync(steps, context, new(new()), token).ConfigureAwait(false);
             if (!state.Picture.IsComplete(recipe.FilmKind))
                 throw new InvalidDataException("Automatic calibration did not produce exposed light and the required clear film samples.");
-            result = pending with { PictureCalibration = state.Picture, Accepted = false, AcceptedAt = null };
+            result = pending with { PictureCalibration = state.Picture };
         }
         catch (InvalidDataException error)
         {
@@ -76,7 +76,7 @@ public static class FrameCalibration
             await SaveDiagnosticsAsync().ConfigureAwait(false);
             throw new InvalidDataException($"{error.Message} Diagnostics: {logPath}", error);
         }
-        diagnostics.Add("Result: measured; recipe remains an unaccepted draft.");
+        diagnostics.Add("Result: measured for this frame.");
         await SaveDiagnosticsAsync().ConfigureAwait(false);
         return result;
 
@@ -113,7 +113,7 @@ public static class FrameCalibration
             message => System.Diagnostics.Trace.WriteLine(message), progress);
         IReadOnlyList<ICalibrationStep> steps = [new ManualPickStep(target, x, y, local)];
         var state = await CalibrationPipeline.RunAsync(steps, context, new(local.PictureCalibration), token).ConfigureAwait(false);
-        return local with { PictureCalibration = state.Picture, Accepted = false, AcceptedAt = null };
+        return local with { PictureCalibration = state.Picture };
     }
 
     public static bool TryMapPoint(double viewportWidth, double viewportHeight, double imageWidth,

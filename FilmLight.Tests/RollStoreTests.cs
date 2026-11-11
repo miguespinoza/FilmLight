@@ -90,22 +90,14 @@ public sealed class RollStoreTests : IDisposable
     }
 
     [Fact]
-    public void AcceptanceRequiresFramesAndMatchingReferencesAndNegativeBase()
+    public void ExportRequiresFramesButDoesNotRequirePreviewOrCalibration()
     {
         var store = Create(FilmKind.ColorNegative);
-        var recipe = new DevelopRecipe { FilmKind = FilmKind.ColorNegative };
-        Assert.Throws<InvalidOperationException>(() => store.SaveRecipe(recipe, true));
         Assert.Throws<InvalidOperationException>(() => store.SetPhase(WorkflowPhase.Develop));
         Assert.Throws<InvalidOperationException>(() => store.SetPhase(WorkflowPhase.Export));
         Capture(store, mode: CaptureMode.Rgb);
-        Capture(store, CapturePurpose.LightReference);
-        Assert.Throws<InvalidOperationException>(() => store.SaveRecipe(recipe, true));
-        Capture(store, CapturePurpose.LightReference, CaptureMode.Rgb);
-        Assert.Throws<InvalidOperationException>(() => store.SaveRecipe(recipe, true));
-        Capture(store, CapturePurpose.FilmBaseReference, CaptureMode.Rgb);
         store.SetPhase(WorkflowPhase.Capture);
         store.SetPhase(WorkflowPhase.Develop);
-        Assert.True(store.SaveRecipe(recipe, true).Accepted);
         store.SetPhase(WorkflowPhase.Export);
         Assert.Equal(WorkflowPhase.Export, RollStore.Open(Root).Document.Phase);
     }
@@ -123,23 +115,22 @@ public sealed class RollStoreTests : IDisposable
         var basis = new PictureSample(first.Id, .3, .4, .6, .3, .2) { SourceWidth = measuredWidth, SourceHeight = measuredHeight };
         var recipe = new DevelopRecipe
         {
-            FilmKind = FilmKind.ColorNegative, PictureCalibration = new() { Light = light }
+            FrameId = first.Id, FilmKind = FilmKind.ColorNegative, PictureCalibration = new() { Light = light }
         };
-        Assert.Throws<InvalidOperationException>(() => store.SaveRecipe(recipe, true));
-        var accepted = store.SaveRecipe(recipe with { PictureCalibration = new() { Light = light, FilmBase = basis } }, true);
+        var saved = store.SaveRecipe(recipe with { PictureCalibration = new() { Light = light, FilmBase = basis } });
         store.SetPhase(WorkflowPhase.Export);
         var reopened = RollStore.Open(Root);
-        Assert.Equal(accepted, reopened.Document.Recipes.Single());
+        Assert.Equal(saved, reopened.Document.Recipes.Single());
         Assert.Equal([first.Id, second.Id], reopened.Document.Captures.Select(c => c.Id));
         Assert.All(reopened.Document.Captures, c => Assert.Equal(CapturePurpose.Frame, c.Purpose));
         Assert.Throws<InvalidOperationException>(() => store.SaveRecipe(recipe with
         {
             PictureCalibration = new() { Light = light with { FrameId = Guid.NewGuid() }, FilmBase = basis }
-        }, false));
+        }));
         Assert.Throws<ArgumentException>(() => store.SaveRecipe(recipe with
         {
             PictureCalibration = new() { Light = light with { Red = double.NaN }, FilmBase = basis }
-        }, false));
+        }));
     }
 
     [Fact]
@@ -156,7 +147,7 @@ public sealed class RollStoreTests : IDisposable
                 Light = new(first.Id, .1, .2, .8, .7, .6),
                 FilmBase = new(first.Id, .3, .4, .5, .25, .1)
             }
-        }, true);
+        });
         var secondRecipe = saved.ForFrame(second.Id);
         Assert.Null(secondRecipe.PictureCalibration);
         var other = store.SaveRecipe(secondRecipe with
@@ -166,18 +157,18 @@ public sealed class RollStoreTests : IDisposable
                 Light = new(second.Id, .1, .2, .4, .35, .3),
                 FilmBase = new(second.Id, .3, .4, .25, .125, .05)
             }
-        }, true);
+        });
         var reopened = RollStore.Open(Root);
         Assert.Equal(saved, reopened.Document.Recipes[0]);
         Assert.Equal(other, reopened.Document.Recipes[1]);
-        Assert.Throws<InvalidOperationException>(() => store.SaveRecipe(saved with { FrameId = second.Id }, false));
+        Assert.Throws<InvalidOperationException>(() => store.SaveRecipe(saved with { FrameId = second.Id }));
         Assert.Throws<InvalidOperationException>(() => store.SaveRecipe(other with
         {
             PictureCalibration = saved.PictureCalibration
-        }, false));
+        }));
         Assert.Throws<InvalidDataException>(() => store.RecordExport(new(second.Id, saved.Id, saved.Revision,
             ExportState.Failed, [], "Must not use another frame's recipe.", DateTimeOffset.UtcNow)));
-        var edited = store.SaveRecipe(other with { ExposureEv = 1 }, true);
+        var edited = store.SaveRecipe(other with { ExposureEv = 1 });
         Assert.Equal(other.Revision + 1, edited.Revision);
         Assert.Equal(saved, RollStore.Open(Root).Document.Recipes[0]);
     }
@@ -200,7 +191,7 @@ public sealed class RollStoreTests : IDisposable
             Assert.Throws<ArgumentException>(() => store.SaveRecipe(new()
             {
                 FilmKind = FilmKind.ColorNegative, PictureCalibration = picture
-            }, true));
+            }));
         Assert.Empty(RollStore.Open(Root).Document.Recipes);
     }
 
@@ -208,13 +199,51 @@ public sealed class RollStoreTests : IDisposable
     public void OlderRecipesWithoutPictureCalibrationRemainReadable()
     {
         var store = Ready();
-        var saved = store.SaveRecipe(new DevelopRecipe { FilmKind = FilmKind.Positive }, true);
+        var saved = store.SaveRecipe(new DevelopRecipe { FilmKind = FilmKind.Positive });
         var manifest = Path.Combine(Root, "roll.json");
         var json = JsonNode.Parse(File.ReadAllText(manifest))!.AsObject();
         json["Recipes"]![0]!.AsObject().Remove(nameof(DevelopRecipe.PictureCalibration));
         json["Recipes"]![0]!.AsObject().Remove(nameof(DevelopRecipe.FrameId));
         File.WriteAllText(manifest, json.ToJsonString());
         Assert.Equal(saved, RollStore.Open(Root).Document.Recipes.Single());
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void LegacyApprovalMetadataIsRemovedWithoutLosingRevisionsOrExportHistory(bool frameScoped)
+    {
+        var store = Ready();
+        var frame = store.Document.Captures.Single(c => c.Purpose == CapturePurpose.Frame);
+        var original = store.SaveRecipe(new()
+        {
+            FilmKind = FilmKind.Positive, FrameId = frameScoped ? frame.Id : null, ExposureEv = .5
+        });
+        var latest = store.SaveRecipe(original with { ExposureEv = 1.5 });
+        var manifest = Path.Combine(Root, "roll.json");
+        var json = JsonNode.Parse(File.ReadAllText(manifest))!.AsObject();
+        json["SchemaVersion"] = 1;
+        json["AcceptedRecipeId"] = original.Id;
+        foreach (var recipe in json["Recipes"]!.AsArray())
+        {
+            recipe!["Accepted"] = recipe["Revision"]!.GetValue<int>() == original.Revision;
+            recipe["AcceptedAt"] = recipe["Accepted"]!.GetValue<bool>()
+                ? System.Text.Json.JsonSerializer.SerializeToNode(DateTimeOffset.UtcNow) : null;
+        }
+        var export = new FrameExport(frame.Id, original.Id, original.Revision, ExportState.Failed,
+            [], "Previous export failed.", DateTimeOffset.UtcNow);
+        json["Exports"] = new JsonArray(System.Text.Json.JsonSerializer.SerializeToNode(export));
+        File.WriteAllText(manifest, json.ToJsonString());
+
+        var reopened = RollStore.Open(Root);
+        Assert.Equal(2, reopened.Document.SchemaVersion);
+        Assert.Equal([original, latest], reopened.Document.Recipes);
+        Assert.Equal(export.RecipeRevision, Assert.Single(reopened.Document.Exports).RecipeRevision);
+        var next = reopened.SaveRecipe(latest with { ExposureEv = 2 });
+        Assert.Equal(3, next.Revision);
+        var rewritten = File.ReadAllText(manifest);
+        Assert.DoesNotContain("Accepted", rewritten);
+        Assert.Equal(next, RollStore.Open(Root).Document.Recipes.Last());
     }
 
     [Fact]
@@ -226,7 +255,7 @@ public sealed class RollStoreTests : IDisposable
         var saved = store.SaveRecipe(new DevelopRecipe
         {
             FilmKind = FilmKind.Positive, PictureCalibration = new() { Light = light }
-        }, true);
+        });
         var manifest = Path.Combine(Root, "roll.json");
         var json = JsonNode.Parse(File.ReadAllText(manifest))!.AsObject();
         var sample = json["Recipes"]![0]![nameof(DevelopRecipe.PictureCalibration)]!["Light"]!.AsObject();
@@ -242,25 +271,21 @@ public sealed class RollStoreTests : IDisposable
     }
 
     [Fact]
-    public void AcceptedRevisionsAndXmpRemainImmutableWhenLaterDraftsAreSaved()
+    public void RevisionsAndXmpRemainImmutableWhenLaterSettingsAreSaved()
     {
         var store = Ready();
-        var xmp = WriteFile("external.xmp", "accepted template");
-        var accepted = store.SaveRecipe(new DevelopRecipe { FilmKind = FilmKind.Positive, XmpTemplatePath = xmp }, true);
+        var xmp = WriteFile("external.xmp", "original template");
+        var original = store.SaveRecipe(new DevelopRecipe { FilmKind = FilmKind.Positive, XmpTemplatePath = xmp });
         File.WriteAllText(xmp, "edited template");
-        var draft = store.SaveRecipe(accepted with { ExposureEv = 2, XmpTemplatePath = xmp }, false);
+        var draft = store.SaveRecipe(original with { ExposureEv = 2, XmpTemplatePath = xmp });
         Assert.Equal(2, draft.Revision);
-        Assert.False(draft.Accepted);
-        Assert.Null(draft.AcceptedAt);
-        Assert.Equal("accepted template", File.ReadAllText(accepted.XmpTemplatePath!));
-        var next = store.SaveRecipe(draft, true);
+        Assert.Equal("original template", File.ReadAllText(original.XmpTemplatePath!));
+        var next = store.SaveRecipe(draft);
         Assert.Equal(3, next.Revision);
         var reopened = RollStore.Open(Root);
         Assert.Equal([1, 2, 3], reopened.Document.Recipes.Select(r => r.Revision));
-        Assert.True(reopened.Document.Recipes[0].Accepted);
         Assert.Equal(0, reopened.Document.Recipes[0].ExposureEv);
-        Assert.Equal(accepted.Id, reopened.Document.AcceptedRecipeId);
-        Assert.NotEqual(accepted.XmpTemplatePath, next.XmpTemplatePath);
+        Assert.NotEqual(original.XmpTemplatePath, next.XmpTemplatePath);
     }
 
     [Fact]
@@ -289,24 +314,21 @@ public sealed class RollStoreTests : IDisposable
         ];
         var before = File.ReadAllText(Path.Combine(Root, "roll.json"));
         foreach (var draft in invalid)
-            Assert.Throws<ArgumentException>(() => store.SaveRecipe(draft, true));
+            Assert.Throws<ArgumentException>(() => store.SaveRecipe(draft));
         Assert.Equal(before, File.ReadAllText(Path.Combine(Root, "roll.json")));
         Assert.Empty(store.Document.Recipes);
     }
 
     [Fact]
-    public void ExportRequiresFrameAcceptedRevisionAndRealOutputsAndRetainsFailures()
+    public void ExportRequiresFrameSavedRevisionAndRealOutputsAndRetainsFailures()
     {
         var store = Ready();
         var frame = store.Document.Captures.Single(c => c.Purpose == CapturePurpose.Frame);
         var reference = store.Document.Captures.Single(c => c.Purpose == CapturePurpose.LightReference);
-        var draft = store.SaveRecipe(new DevelopRecipe { FilmKind = FilmKind.Positive }, false);
+        var draft = store.SaveRecipe(new DevelopRecipe { FilmKind = FilmKind.Positive, FrameId = frame.Id });
         var output = WriteFile("exports\\frame.tif", "export data");
         var complete = new FrameExport(frame.Id, draft.Id, draft.Revision, ExportState.Complete,
             [output], null, DateTimeOffset.UtcNow);
-        Assert.Throws<InvalidDataException>(() => store.RecordExport(complete));
-        var accepted = store.SaveRecipe(draft, true);
-        complete = complete with { RecipeRevision = accepted.Revision };
         Assert.Throws<InvalidDataException>(() => store.RecordExport(complete with { FrameId = reference.Id }));
         Assert.Throws<InvalidDataException>(() => store.RecordExport(complete with { FrameId = Guid.NewGuid() }));
         Assert.Throws<InvalidDataException>(() => store.RecordExport(complete with { RecipeRevision = 999 }));
@@ -340,12 +362,12 @@ public sealed class RollStoreTests : IDisposable
     public void OpenRejectsCorruptSchemaSetsPathsIdentityAndMissingOwnedFiles()
     {
         var store = Ready();
-        store.SaveRecipe(new DevelopRecipe { FilmKind = FilmKind.Positive }, true);
+        store.SaveRecipe(new DevelopRecipe { FilmKind = FilmKind.Positive });
         var manifest = Path.Combine(Root, "roll.json");
         var good = File.ReadAllText(manifest);
         Action<JsonObject>[] corruptions =
         [
-            json => json["SchemaVersion"] = 2,
+            json => json["SchemaVersion"] = 3,
             json => json.Remove("IsDemo"),
             json => json["Captures"]![0]!["Files"] = new JsonArray(),
             json => json["Captures"]![0]!["Files"]![0]!["Path"] = WriteFile("outside.raw", "not owned"),
@@ -353,8 +375,8 @@ public sealed class RollStoreTests : IDisposable
             json => json["Captures"]![0]!["Number"] = 42,
             json => json["Captures"]![0]!["Mode"] = 999,
             json => json["Recipes"]![0]!["Revision"] = 4,
-            json => json["Recipes"]![0]!["AcceptedAt"] = null,
-            json => json["AcceptedRecipeId"] = Guid.NewGuid().ToString(),
+            json => json["Recipes"]![0]!["FrameId"] = Guid.NewGuid().ToString(),
+            json => json["UnexpectedProperty"] = true,
             json => json["Exports"] = null
         ];
         foreach (var corrupt in corruptions)

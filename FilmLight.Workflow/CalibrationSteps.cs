@@ -20,27 +20,28 @@ internal sealed class ClippingVerificationStep : ICalibrationStep
 
     public async Task<CalibrationState> ApplyAsync(CalibrationContext context, CalibrationState state, CancellationToken token)
     {
-        await VerifyAsync(state.Picture.Light, state.LightEvidence, CalibrationTarget.Backlight).ConfigureAwait(false);
-        await VerifyAsync(state.Picture.FilmBase, state.FilmBaseEvidence, CalibrationTarget.FilmBase).ConfigureAwait(false);
-        return state;
+        var light = await VerifyAsync(state.Picture.Light, state.LightEvidence, CalibrationTarget.Backlight).ConfigureAwait(false);
+        var basis = await VerifyAsync(state.Picture.FilmBase, state.FilmBaseEvidence, CalibrationTarget.FilmBase).ConfigureAwait(false);
+        if (light == state.Picture.Light && basis == state.Picture.FilmBase) return state;
+        return state with { Picture = state.Picture with { Light = light, FilmBase = basis } };
 
-        async Task VerifyAsync(PictureSample? sample, SampleEvidence? evidence, CalibrationTarget target)
+        async Task<PictureSample?> VerifyAsync(PictureSample? sample, SampleEvidence? evidence, CalibrationTarget target)
         {
             if (sample is null || evidence is null)
-                return;
+                return sample;
             context.Diagnostic(FormattableString.Invariant(
                 $"{target} peak={evidence.Peak:F6}; measured-edge={evidence.MeasuredLongEdge}; verification={(evidence.Peak >= HeadroomThreshold ? "full-resolution" : "skipped (headroom)")}"));
-            if (evidence.Peak < HeadroomThreshold) return;
+            if (evidence.Peak < HeadroomThreshold) return sample;
 
             // Full-resolution dimensions are needed to turn the evidence extents into a pixel radius.
             var center = await context.Source.MeasureAsync(sample.X, sample.Y, 0, token, context.Progress).ConfigureAwait(false);
-            if (evidence.MeasuredLongEdge >= Math.Max(center.SourceWidth, center.SourceHeight)) return;
+            if (evidence.MeasuredLongEdge >= Math.Max(center.SourceWidth, center.SourceHeight)) return sample;
             double halfWidth = evidence.HalfWidth * center.SourceWidth;
             double halfHeight = evidence.HalfHeight * center.SourceHeight;
             int extent = (int)Math.Ceiling(Math.Max(halfWidth, halfHeight));
             int radius = Math.Clamp(extent, 0, 256);
             var patch = await context.Source.MeasureAsync(sample.X, sample.Y, radius, token, context.Progress).ConfigureAwait(false);
-            if (radius >= extent && !patch.IsClipped && !patch.IsDarkOrInvalid) return;
+            if (radius >= extent && !patch.IsClipped && !patch.IsDarkOrInvalid) return sample;
 
             // Aggregate flags mean "any pixel"; apply the shared patch rule before rejecting.
             var values = new List<double>[] { [], [], [] };
@@ -50,10 +51,12 @@ internal sealed class ClippingVerificationStep : ICalibrationStep
                 for (int c = 0; c < 3; c++)
                     values[c].Add(point.Mean[c]);
             }
-            var result = PatchRule.Evaluate(values);
+            var result = PatchRule.Evaluate(values, allowClipped: target == CalibrationTarget.Backlight);
             context.Diagnostic($"{target} full-resolution verification: high=({string.Join(", ", result.High)}); low=({string.Join(", ", result.Low)}); points={values[0].Count}");
             if (result.Rejection is not null)
                 throw SprocketCalibration.InvalidPatch(target, result.High.Any(v => v > 0), result.Low.Any(v => v > 0));
+            return target == CalibrationTarget.Backlight && result.High.Any(v => v > 0)
+                ? sample with { IsClipped = true } : sample;
         }
     }
 }
