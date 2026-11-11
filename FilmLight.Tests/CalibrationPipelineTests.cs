@@ -72,12 +72,10 @@ public sealed class CalibrationPipelineTests : IDisposable
         var frame = Frame();
         var roll = new RollDocument { Captures = [frame] };
         var prepared = await FrameCalibration.PrepareAsync([new ClippingVerificationStep()], sources,
-            roll, frame, new() { Accepted = true }, root, default);
+            roll, frame, new(), root, default);
         Assert.Equal(frame.Id, prepared.Recipe.FrameId);
         Assert.NotNull(prepared.Recipe.PictureCalibration);
         Assert.False(prepared.Recipe.PictureCalibration.IsComplete(roll.FilmKind));
-        Assert.False(prepared.Recipe.Accepted);
-        Assert.Null(prepared.Recipe.AcceptedAt);
         Assert.Contains("uncalibrated", prepared.Warning);
         Assert.Contains("Diagnostics:", prepared.Warning);
         Assert.Single(Directory.GetFiles(Path.Combine(root, "calibration-diagnostics"), "auto-*.log"));
@@ -93,7 +91,7 @@ public sealed class CalibrationPipelineTests : IDisposable
     [InlineData(CalibrationTarget.Backlight, 12, false)]
     [InlineData(CalibrationTarget.FilmBase, 12, false)]
     [InlineData(CalibrationTarget.Backlight, 12, true)]
-    public async Task VerificationRetainsDetectorFivePercentRuleAndNeverChangesSamples(
+    public async Task VerificationMarksClippedBacklightButStillRejectsInvalidFilmBaseAndDarkPatches(
         CalibrationTarget target, int badPoints, bool dark)
     {
         Directory.CreateDirectory(root);
@@ -117,7 +115,12 @@ public sealed class CalibrationPipelineTests : IDisposable
             : new CalibrationState(new() { FilmBase = sample }) { FilmBaseEvidence = evidence };
         using var sources = new FrameSources(Path.Combine(root, "cache"), null);
         var context = new CalibrationContext(roll, frame, roll.FilmKind, sources.Open(roll, frame), _ => { }, null);
-        if (badPoints <= 225 * .05)
+        if (target == CalibrationTarget.Backlight && !dark)
+        {
+            var result = await CalibrationPipeline.RunAsync([new ClippingVerificationStep()], context, initial, default);
+            Assert.Equal(sample with { IsClipped = true }, result.Picture.Light);
+        }
+        else if (badPoints <= 225 * .05)
             Assert.Same(initial, await CalibrationPipeline.RunAsync([new ClippingVerificationStep()], context, initial, default));
         else
         {

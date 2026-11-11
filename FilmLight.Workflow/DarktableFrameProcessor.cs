@@ -6,7 +6,7 @@ namespace FilmLight.Workflow;
 /// Runs pinned darktable 5.6.2 on RAFs or qualified linear TIFFs.
 /// Physical exposure, emitter/camera spectral calibration and registration remain hardware responsibilities.
 /// Preview reuses content-keyed inversion results; export always develops and encodes a fresh master.
-/// The roll coordinator must gate accepted exports and freeze any external XMP at acceptance.
+/// The roll coordinator persists frame settings and owns imported XMP snapshots.
 /// </summary>
 [SupportedOSPlatform("windows")]
 public sealed class DarktableFrameProcessor : IFrameProcessor

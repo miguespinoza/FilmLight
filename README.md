@@ -136,16 +136,15 @@ are disabled during exposures, downloads, processing and connection setup.
    displayed JPEG. Manual pick coordinates use the recipe crop fractions; patches
    stop at sensor boundaries, not crop edges. A manual backlight pick that contains clipped values is still
    saved with its red marker, but is labelled **WB correction skipped**. It counts
-   as the light pick for acceptance; its RGB values are not used to normalize
+   as the light pick for this frame; its RGB values are not used to normalize
    the input or alter darktable's processing settings. The film-base pick and
    other develop settings still apply. Pick an unclipped backlight patch again
    to restore measured normalization. Dark/invalid picks and clipped film-base
-   picks are still rejected. Manual picks that complete calibration and produce
-   a successful preview are saved as an accepted revision for this frame only.
+   picks are still rejected. Manual picks are saved immediately for this frame only.
    Picks remain saved after reopening or reconnecting; automatic calibration
    means no routine manual picking is required. **Reset picks** reruns automatic
    detection for the selected frame. Previous
-   accepted revisions and outputs remain intact.
+   saved revisions and outputs remain intact.
    **Auto-pick light + base** explicitly reruns the same automatic finder: it looks for
    at least three evenly spaced sprocket holes near an edge of the
    uncropped RAW, with the film strip roughly horizontal or vertical. It measures
@@ -160,11 +159,16 @@ are disabled during exposures, downloads, processing and connection setup.
    proxy, never screenshot/JPEG colors. Samples with a peak channel of 0.9 or
    higher are checked for clipping/dark pixels at full resolution, retaining the
    detector's shared patch rule and 5% tolerance; samples below that threshold need no full decode.
-   Manual picks always measure full-resolution pixels. Internally, the calibration
+   Manual picks always measure full-resolution pixels. Clipped automatic backlight
+   picks use the same marker-only behavior as manual picks: film-base and develop
+   settings still apply, but measured WB/backlight normalization is skipped with
+   an explicit warning. An RGB value at or above 1 is treated conservatively as
+   out of range; it does not, by itself, prove sensor saturation.
+   Internally, the calibration
    module runs an ordered step list: sprocket detection then clipping verification
    for automatic picks, or a manual-pick adapter for manual picks. No neural network
    or additional runtime is required.
-   Clipped, nonuniform or conflicting measurements are rejected without changing
+   Clipped film-base, dark, nonuniform or conflicting measurements are rejected without changing
    existing picks; use manual picking when perforations are absent, obscured or
    substantially rotated. If backlight values are clipped/out of range, a manual
    marker-only backlight pick remains available; changing the develop exposure
@@ -173,8 +177,8 @@ are disabled during exposures, downloads, processing and connection setup.
    Auto-pick logs candidate-hole counts, row rejection stages, rejected patch RGB
    ranges and selected samples under `Working\calibration-diagnostics` in the roll.
    Failures show the diagnostic log path and leave existing picks untouched.
-   Automatic picks remain an **unaccepted draft** until
-   you inspect and accept their positive preview. Crop and other develop controls
+   Automatic picks are saved for this frame and used for its previews and exports.
+   Crop and other develop controls
    are preserved; the saved samples belong only to this frame. Positive film
    uses only the backlight sample. Partially cropped holes are supported when
    enough of their interiors remain visible. Geometric localization has been
@@ -201,7 +205,7 @@ are disabled during exposures, downloads, processing and connection setup.
    one darktable inversion launch and in-process output encoding; they no longer
    write `positive-linear.tif` or `output-positive.xmp`.
    The WinUI-free `FrameWorkflow` owns per-frame drafts, prepare/preview/picks,
-   exact-preview acceptance and resumable export/publication. The window only
+   saved settings and resumable export/publication. The window only
    displays results and owns camera, illumination and UI operation state.
    Each workflow keeps one processor and one shared, lazily created
    `FrameSources` cache; opening another roll or changing the darktable path
@@ -225,15 +229,14 @@ are disabled during exposures, downloads, processing and connection setup.
 2. **Develop (optional):** in **Develop settings**, adjust rendering exposure, channel
    gains, measured film-base multipliers, black/white levels and crop, then
    **Render Preview**. Pick light and film before cropping them out of the picture.
-   **Accept this preview** saves an immutable recipe revision; editing any setting
-   requires another preview. These controls do not change camera exposure.
-3. **Export:** process missing/failed frames using each frame's accepted revision.
-   Frames without an accepted recipe are independently auto-calibrated using the
-   latest approved develop controls, then saved as their own immutable recipe.
-   Samples are never copied between frames. Unaccepted develop edits are not used
-   as batch defaults. Incomplete calibration remains an explicit warning on
-   provisional previews/exports, not a reason to block a successfully rendered
-   image from being accepted.
+   Changes save an immutable recipe revision immediately; there is no acceptance
+   step. These controls do not change camera exposure.
+3. **Export:** process missing/failed frames using each frame's current saved settings,
+   even if the latest edit has not been previewed. Unedited frames follow the
+   immediately previous frame's develop controls, including later changes, until
+   manually overridden. The first frame starts from defaults. Calibration samples
+   are always measured independently and never inherited.
+   Incomplete calibration remains an explicit warning on provisional previews/exports.
    A successful export is a validated 16-bit TIFF master and JPEG companion.
    Pause/cancel retains inputs and diagnostic artifacts. Missing outputs can be
    regenerated without overwriting existing files.
@@ -249,10 +252,15 @@ calibration history; **Open / resume** restores the roll.
 Roll manifests currently use absolute paths: keep the roll at its original location
 when resuming it.
 
-Recipes and calibration are frame-scoped. Accepting or repicking one frame does
-not alter another frame's accepted settings or exports. Older roll-wide recipes
-remain readable as history and develop defaults; opening/rendering/exporting
-through the workflow creates frame-scoped recipes and measures missing calibration
+Calibration and overrides are frame-scoped. Repicking one frame does not change
+another frame's calibration. Develop-control edits propagate only through
+following frames that have not been manually overridden; existing exports remain
+intact until explicitly re-exported. Version 1 roll manifests remain
+readable; their approval flags are discarded, and the next save writes version 2.
+Older roll-wide recipes remain as history, not defaults for other frames. Existing
+frame-specific recipes retain their controls as local overrides. New frames follow
+their previous sibling's controls until manually edited.
+Opening/rendering/exporting through the workflow creates frame-scoped recipes and measures missing calibration
 from each frame. Original captures and legacy references are never deleted
 automatically. A rendered TIFF
 is not reversible RAW and cannot replace retained captures for future reinversion.
@@ -384,7 +392,7 @@ the desktop is unavailable to GDI; UI Automation checks still run.
 
 The three-phase native workflow smoke check uses an explicitly synthetic camera,
 exercises reference-free capture, mouse picks reused on later frames and reopen,
-preview invalidation/acceptance, TIFF/JPEG export, missing-output retry,
+preview invalidation, frame-local saved settings, TIFF/JPEG export, missing-output retry,
 automatic folder creation and the metadata-rich resume dialog. It leaves its demo
 roll under `Pictures\FilmLight\Rolls`; diagnostic fixtures stay under `artifacts`:
 
@@ -411,6 +419,8 @@ cases are explicitly skipped, not reported as real processing.
 Optional public RAW fixture checks use `FILMLIGHT_TEST_RAF`,
 `FILMLIGHT_TEST_SIGNED_RAF` and `FILMLIGHT_TEST_LOSSY_RAF`; those tests also explicitly
 skip when their fixtures are unavailable.
+`FILMLIGHT_TEST_SPROCKET_RAF` optionally supplies a film scan with out-of-range
+backlight values and valid clear film to replay automatic marker-only calibration.
 
 ## Camera-control seam
 

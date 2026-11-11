@@ -211,7 +211,7 @@ if ($ProbePreviewErrors -or $ProbeReconnect -or $ProbeProgress) {
             Id = [Guid]::NewGuid(); Revision = 1; FilmKind = 0; XmpTemplatePath = $null
             ExposureEv = 0; RedGain = 1; GreenGain = 1; BlueGain = 1
             FilmBaseRed = 1; FilmBaseGreen = 1; FilmBaseBlue = 1; BlackPoint = 0; WhitePoint = 1
-            CropLeft = 0; CropTop = 0; CropRight = 0; CropBottom = 0; Accepted = $false; AcceptedAt = $null
+            CropLeft = 0; CropTop = 0; CropRight = 0; CropBottom = 0; FrameId = $id
             PictureCalibration = @{
                 Light = @{ FrameId = $id; X = .1; Y = .5; Red = .8; Green = .7; Blue = .6 }
                 FilmBase = @{ FrameId = $id; X = .2; Y = .5; Red = .6; Green = .3; Blue = .2 }
@@ -219,10 +219,10 @@ if ($ProbePreviewErrors -or $ProbeReconnect -or $ProbeProgress) {
         })
     }
     @{
-        SchemaVersion = 1; Id = [Guid]::NewGuid()
+        SchemaVersion = 2; Id = [Guid]::NewGuid()
         Name = $(if ($ProbeProgress) { 'Saved RAW progress fixture - no camera connection' } else { 'JPEG rejection test fixture - not camera photographs' })
         FilmKind = 0; IsDemo = $false; Phase = 2; Captures = $captures
-        Recipes = $recipes; Exports = @(); AcceptedRecipeId = $null; IntermediatesTrashed = $false
+        Recipes = $recipes; Exports = @(); IntermediatesTrashed = $false
     } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $fixtureRoot 'roll.json') -Encoding UTF8
 }
 $process = Start-Process -FilePath (Resolve-Path $AppPath) -PassThru
@@ -372,14 +372,14 @@ try {
         throw 'Bottom toolbar does not span the full window width.'
     }
     Invoke-Button 'Pick backlight WB'
-    Wait-Text 'Click an exposed backlight patch' | Write-Output
-    Pick-SourcePoint (3.0 / 384) .5 1
+    Wait-Text 'Click exposed backlight (no film).' | Write-Output
+    Pick-SourcePoint (3.0 / 384) .5 2
     Invoke-Button 'Pick film base'
     Wait-Text 'Click clear/unexposed developed film' | Write-Output
     Pick-SourcePoint (12.0 / 384) .5 3
     $picked = @((Read-Roll).Recipes)[-1]
-    if (!$picked.Accepted -or !$picked.PictureCalibration.Light -or !$picked.PictureCalibration.FilmBase) {
-        throw 'The two mouse picks were not automatically applied to the entire roll.'
+    if (!$picked.PictureCalibration.Light -or !$picked.PictureCalibration.FilmBase) {
+        throw 'The two mouse picks were not saved for the selected frame.'
     }
     $savedPicks = $picked.PictureCalibration | ConvertTo-Json -Compress
     $origin = (Read-Roll).Captures[0].Id
@@ -387,12 +387,14 @@ try {
         throw 'Picture picks do not identify their source frame.'
     }
     Invoke-Button 'Capture frame 2'
-    Wait-Text 'Frame 2 saved. Positive preview uses the roll' | Write-Output
+    Wait-Text "Frame 2 saved. Positive preview uses this frame's own" | Write-Output
     Wait-Text 'SYNTHETIC - Frame 2 - positive preview' | Write-Output
     $captured = Read-Roll
-    if ($captured.Recipes.Count -ne 3 -or $captured.AcceptedRecipeId -ne $picked.Id -or
-        ($captured.Recipes[-1].PictureCalibration | ConvertTo-Json -Compress) -ne $savedPicks) {
-        throw 'Capturing another frame changed or discarded the saved roll-wide picture picks.'
+    $firstRecipe = @($captured.Recipes | Where-Object FrameId -eq $origin)[-1]
+    $secondRecipe = @($captured.Recipes | Where-Object FrameId -eq $captured.Captures[1].Id)[-1]
+    if (($firstRecipe.PictureCalibration | ConvertTo-Json -Compress) -ne $savedPicks -or
+        $secondRecipe.PictureCalibration.Light.FrameId -ne $captured.Captures[1].Id) {
+        throw 'Capturing another frame changed or shared frame-local picture picks.'
     }
     if ($captured.Captures.Count -ne 2 -or $captured.Exports.Count -ne 0 -or
         @($captured.Captures | Where-Object Purpose -ne 2).Count -ne 0) {
@@ -417,21 +419,21 @@ try {
     Invoke-Button '2. Develop'
     Invoke-Button 'Render Preview'
     Wait-Text 'Preview rendered for the exact current recipe' | Write-Output
-    if (!(Wait-Control 'Accept this preview').Current.IsEnabled) { throw 'Successful preview did not enable acceptance.' }
+    if ($null -ne (Find-Control 'Accept this preview')) { throw 'Obsolete acceptance button is still present.' }
     Invoke-Button 'Develop settings'
     Invoke-Button 'Increase Exposure EV'
-    Wait-Text 'Unaccepted edits.' | Write-Output
-    if ((Wait-Control 'Accept this preview').Current.IsEnabled) { throw 'Edited recipe was accepted without a new preview.' }
-    Invoke-Button 'Render Preview'
-    Wait-Text 'Preview rendered for the exact current recipe' | Write-Output
-    Invoke-Button 'Accept this preview'
-    Wait-Text 'Accepted immutable recipe' | Write-Output
+    Wait-Text 'Settings saved for this frame.' | Write-Output
     Invoke-Button '3. Export'
     Invoke-Button 'Export missing / failed'
     Wait-Text 'Batch finished: 2/2 complete, 0 failed.' 60 | Write-Output
     $exported = Read-Roll
     $complete = @($exported.Exports | Where-Object State -eq 2)
     if ($complete.Count -ne 2) { throw 'Both frames were not recorded as complete exports.' }
+    $secondExport = @($complete | Where-Object FrameId -eq $captured.Captures[1].Id)[-1]
+    $exportedRecipe = @($exported.Recipes | Where-Object {
+        $_.Id -eq $secondExport.RecipeId -and $_.Revision -eq $secondExport.RecipeRevision
+    })[0]
+    if ($exportedRecipe.ExposureEv -ne .25) { throw 'Export ignored the latest saved, unpreviewed settings.' }
     foreach ($item in $complete) {
         foreach ($path in $item.OutputFiles) {
             if (!(Test-Path -LiteralPath $path) -or (Get-Item -LiteralPath $path).Length -lt 100) {
@@ -461,7 +463,8 @@ try {
     Invoke-Button 'Use Demo camera'
     Wait-Text 'Resumed ' | Write-Output
     Wait-Text 'SIMULATED / SYNTHETIC EXPORTS' | Write-Output
-    if (((Read-Roll).Recipes[-1].PictureCalibration | ConvertTo-Json -Compress) -ne $savedPicks) {
+    $reopenedFirst = @((Read-Roll).Recipes | Where-Object FrameId -eq $origin)[-1]
+    if (($reopenedFirst.PictureCalibration | ConvertTo-Json -Compress) -ne $savedPicks) {
         throw 'Reopening the roll did not restore the picture picks.'
     }
     Invoke-Button '1. Capture'
@@ -473,7 +476,7 @@ try {
     if (@((Read-Roll).Exports | Where-Object State -eq 2).Count -ne 3) {
         throw 'Resume unnecessarily duplicated successful exports.'
     }
-    Write-Output "PASS: reference-free capture/auto-preview, roll-wide mouse light/film picks, TIFF/JPEG jobs, missing-output retry, reopen, unchanged captures. Artifacts: $rollRoot"
+    Write-Output "PASS: reference-free capture/auto-preview, frame-local light/film picks, latest-settings TIFF/JPEG jobs without acceptance, missing-output retry, reopen, unchanged captures. Artifacts: $rollRoot"
 }
 finally {
     if (!$process.HasExited) { Stop-Process -Id $process.Id }

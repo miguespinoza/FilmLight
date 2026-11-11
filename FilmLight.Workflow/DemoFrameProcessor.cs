@@ -6,7 +6,7 @@ namespace FilmLight.Workflow;
 /// A synthetic workflow renderer, not a live-camera processing fallback.
 /// FilmBase* multiply measured clear-film transmissions; crop values are fractional edge removals.
 /// Exposure/gains/levels apply to positive linear samples, identically in preview and export.
-/// Acceptance and durable recipe/sample snapshots are the roll coordinator's responsibility.
+/// Durable frame settings and sample snapshots are the roll coordinator's responsibility.
 /// </summary>
 [SupportedOSPlatform("windows")]
 public sealed class DemoFrameProcessor : IFrameProcessor

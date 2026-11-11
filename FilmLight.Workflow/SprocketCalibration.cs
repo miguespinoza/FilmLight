@@ -19,7 +19,7 @@ internal static class PatchRule
                     y - halfHeight + 2 * halfHeight * (gy + .5) / GridEdge);
     }
 
-    internal static Result Evaluate(List<double>[] samples, bool measureColor = true)
+    internal static Result Evaluate(List<double>[] samples, bool measureColor = true, bool allowClipped = false)
     {
         foreach (var channel in samples) channel.Sort();
         int[] high = samples.Select(s => s.Count(v => v >= Maximum)).ToArray();
@@ -28,9 +28,9 @@ internal static class PatchRule
         string? rejection = null;
         for (int c = 0; c < samples.Length; c++)
         {
-            if (measureColor && high[c] + low[c] > samples[c].Count * BadFraction)
+            if (measureColor && (low[c] + (allowClipped ? 0 : high[c])) > samples[c].Count * BadFraction)
                 rejection = $"channel={c}; at/above maximum={high[c]}/{samples[c].Count}; at/below minimum={low[c]}/{samples[c].Count}";
-            else if (!double.IsFinite(values[c]) || values[c] <= Minimum || (measureColor && values[c] >= Maximum)
+            else if (!double.IsFinite(values[c]) || values[c] <= Minimum || (measureColor && !allowClipped && values[c] >= Maximum)
                 || samples[c][samples[c].Count * 9 / 10] - samples[c][samples[c].Count / 10] > values[c] * SpreadFraction)
                 rejection = $"channel={c}; dark, clipped or nonuniform median/spread";
             if (rejection is not null) break;
@@ -249,7 +249,7 @@ internal static class SprocketCalibration
             throw Failure("Sprocket rows give conflicting light or film-base measurements.", needsGeometry: false);
         if (measureColor)
         {
-            chosen.Light!.Validate();
+            chosen.Light!.Validate(allowClipped: true);
             chosen.FilmBase?.Validate();
         }
         diagnostic?.Invoke("Selected samples: " + System.Text.Json.JsonSerializer.Serialize(chosen));
@@ -272,7 +272,7 @@ internal static class SprocketCalibration
                 double luminance = .2627 * image.Pixels[i] + .6780 * image.Pixels[i + 1] + .0593 * image.Pixels[i + 2];
                 for (int c = 0; c < 3; c++) samples[c].Add(measureColor ? image.Pixels[i + c] : luminance);
             }
-            var result = PatchRule.Evaluate(samples, measureColor);
+            var result = PatchRule.Evaluate(samples, measureColor, allowClipped: target == CalibrationTarget.Backlight);
             if (result.Rejection is { } reason)
             {
                 if (measureColor && target == CalibrationTarget.Backlight)
@@ -286,7 +286,8 @@ internal static class SprocketCalibration
             var sample = new PictureSample(frameId, cx / width, cy / height, values[0], values[1], values[2])
             {
                 SourceWidth = image.Width,
-                SourceHeight = image.Height
+                SourceHeight = image.Height,
+                IsClipped = measureColor && target == CalibrationTarget.Backlight && result.High.Any(v => v > 0)
             };
             evidence[sample] = new(w / (2 * width), h / (2 * height),
                 Math.Max(image.Width, image.Height), result.Peak);
@@ -330,7 +331,10 @@ internal static class SprocketCalibration
         // Scores are scale-free; treat roundoff ties alike before selecting by capture geometry.
         var representative = scores.Where(s => s.Score - best <= Math.Max(1e-12, Math.Max(s.Score, best) * 1e-6))
             .OrderBy(s => s.Sample.X).ThenBy(s => s.Sample.Y).First().Sample;
-        var result = representative with { Red = median[0], Green = median[1], Blue = median[2] };
+        var result = representative with
+        {
+            Red = median[0], Green = median[1], Blue = median[2], IsClipped = samples.Any(s => s.IsClipped)
+        };
         evidence[result] = evidence[representative];
         return result;
     }

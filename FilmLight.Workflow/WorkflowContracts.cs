@@ -83,10 +83,21 @@ public sealed record DevelopRecipe
     public double CropTop { get; init; }
     public double CropRight { get; init; }
     public double CropBottom { get; init; }
-    public bool Accepted { get; init; }
-    public DateTimeOffset? AcceptedAt { get; init; }
     public PictureCalibration? PictureCalibration { get; init; }
     public Guid? FrameId { get; init; }
+    public bool InheritControls { get; init; }
+    public Guid? ControlsSourceRecipeId { get; init; }
+    public int ControlsSourceRevision { get; init; }
+
+    internal DevelopRecipe WithControlsFrom(DevelopRecipe source) => this with
+    {
+        XmpTemplatePath = source.XmpTemplatePath,
+        ExposureEv = source.ExposureEv,
+        RedGain = source.RedGain, GreenGain = source.GreenGain, BlueGain = source.BlueGain,
+        FilmBaseRed = source.FilmBaseRed, FilmBaseGreen = source.FilmBaseGreen, FilmBaseBlue = source.FilmBaseBlue,
+        BlackPoint = source.BlackPoint, WhitePoint = source.WhitePoint,
+        CropLeft = source.CropLeft, CropTop = source.CropTop, CropRight = source.CropRight, CropBottom = source.CropBottom
+    };
 
     public DevelopRecipe ForFrame(Guid frameId)
     {
@@ -99,8 +110,7 @@ public sealed record DevelopRecipe
             local = null;
         return this with
         {
-            Id = Guid.NewGuid(), Revision = 1, FrameId = frameId, PictureCalibration = local,
-            Accepted = false, AcceptedAt = null
+            Id = Guid.NewGuid(), Revision = 1, FrameId = frameId, PictureCalibration = local
         };
     }
 }
@@ -110,7 +120,7 @@ public sealed record FrameExport(Guid FrameId, Guid RecipeId, int RecipeRevision
 
 public sealed record RollDocument
 {
-    public int SchemaVersion { get; init; } = 1;
+    public int SchemaVersion { get; init; } = 2;
     public Guid Id { get; init; } = Guid.NewGuid();
     public string Name { get; init; } = "";
     public DateTimeOffset? CreatedAt { get; init; }
@@ -120,7 +130,6 @@ public sealed record RollDocument
     public List<RollCapture> Captures { get; init; } = [];
     public List<DevelopRecipe> Recipes { get; init; } = [];
     public List<FrameExport> Exports { get; init; } = [];
-    public Guid? AcceptedRecipeId { get; init; }
     public bool IntermediatesTrashed { get; init; }
 }
 

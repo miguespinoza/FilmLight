@@ -38,13 +38,12 @@ public sealed record ExportProgress(string? ActivityStage = null, string? Activi
 [SupportedOSPlatform("windows")]
 public sealed class FrameWorkflow : IDisposable
 {
-    internal const string UnacceptedEditsMessage =
-        "Unaccepted edits. Render Preview again before acceptance. Export still uses only a previously accepted revision.";
+    internal const string SettingsSavedMessage =
+        "Settings saved for this frame. Export uses these settings; refresh the preview to inspect the result.";
     private readonly RollStore store;
     private readonly string? darktableCliPath;
     private readonly Func<FrameSources, IFrameProcessor>? processorFactory;
     private readonly Dictionary<Guid, DevelopRecipe> drafts = [];
-    private readonly Dictionary<Guid, FramePreview> previews = [];
     private DevelopRecipe currentDraft;
     private FrameSources? sources;
     private IFrameProcessor? processor;
@@ -58,16 +57,11 @@ public sealed class FrameWorkflow : IDisposable
         this.store = store ?? throw new ArgumentNullException(nameof(store));
         this.darktableCliPath = darktableCliPath;
         this.processorFactory = processorFactory;
-        currentDraft = Unaccepted(store.Document.Recipes.LastOrDefault()
-            ?? new DevelopRecipe { FilmKind = store.Document.FilmKind });
+        currentDraft = store.Document.Recipes.LastOrDefault(r => r.FrameId is null)
+            ?? new DevelopRecipe { FilmKind = store.Document.FilmKind };
     }
 
     public string PositiveRoot => Path.Combine(store.RootPath, store.Document.IsDemo ? "SYNTHETIC-Positives" : "Positives");
-
-    public DevelopRecipe? AcceptedRecipe(Guid? frameId) =>
-        store.Document.Recipes.LastOrDefault(r => r.Accepted && r.FrameId == frameId);
-
-    public DevelopRecipe? AcceptedSettings() => store.Document.Recipes.LastOrDefault(r => r.Accepted);
 
     public void Prefetch(Guid frameId) => Sources.Prefetch(store.Document, Frame(frameId));
 
@@ -76,12 +70,22 @@ public sealed class FrameWorkflow : IDisposable
     {
         ObjectDisposedException.ThrowIf(disposed, this);
         if (frameId is not { } id) return currentDraft;
-        _ = Frame(id);
+        var frame = Frame(id);
         if (!drafts.TryGetValue(id, out var draft))
         {
-            draft = Unaccepted(store.Document.Recipes.LastOrDefault(r => r.FrameId == id)
-                ?? currentDraft.ForFrame(id));
+            draft = store.Document.Recipes.LastOrDefault(r => r.FrameId == id)
+                ?? new DevelopRecipe { FilmKind = store.Document.FilmKind, FrameId = id, InheritControls = true };
             drafts.Add(id, draft);
+        }
+        if (draft.InheritControls && store.Document.Captures.LastOrDefault(c =>
+            c.Purpose == CapturePurpose.Frame && c.Number == frame.Number - 1) is { } previous)
+        {
+            var source = Draft(previous.Id);
+            if (draft.ControlsSourceRecipeId != source.Id || draft.ControlsSourceRevision != source.Revision)
+                drafts[id] = draft = store.SaveRecipe(draft.WithControlsFrom(source) with
+                {
+                    ControlsSourceRecipeId = source.Id, ControlsSourceRevision = source.Revision
+                });
         }
         return currentDraft = draft;
     }
@@ -94,11 +98,13 @@ public sealed class FrameWorkflow : IDisposable
         {
             if (changed.FrameId.HasValue)
                 throw new InvalidOperationException("Select a captured frame first.");
-            return currentDraft = store.SaveRecipe(Unaccepted(changed), false);
+            return currentDraft = store.SaveRecipe(changed);
         }
-        _ = Frame(id);
-        var saved = store.SaveRecipe(Unaccepted(changed.ForFrame(id)), false);
-        previews.Remove(id);
+        var current = Draft(id);
+        var local = changed.ForFrame(id);
+        if (current.WithControlsFrom(local) != current)
+            local = local with { InheritControls = false, ControlsSourceRecipeId = null, ControlsSourceRevision = 0 };
+        var saved = store.SaveRecipe(local);
         return currentDraft = drafts[id] = saved;
     }
 
@@ -107,7 +113,6 @@ public sealed class FrameWorkflow : IDisposable
         token.ThrowIfCancellationRequested();
         var frame = Frame(frameId);
         var draft = Draft(frameId);
-        previews.Remove(frameId);
         progress?.Report(new(frameId, "Starting positive preview", "Preparing the current recipe and saved input."));
         if (draft.BlackPoint >= draft.WhitePoint)
             throw new InvalidOperationException("Black point must be less than white point.");
@@ -116,7 +121,8 @@ public sealed class FrameWorkflow : IDisposable
         var renderer = Processor;
         var prepared = await FrameCalibration.PrepareAsync(Sources, store.Document, frame, draft,
             Path.Combine(store.RootPath, "Working"), token, progress);
-        if (prepared.Recipe != draft) draft = EditAndReport(frameId, prepared.Recipe, progress);
+        if (prepared.Recipe != draft || !store.Document.Recipes.Contains(draft))
+            draft = EditAndReport(frameId, prepared.Recipe, progress);
         var xmpHash = XmpHash(draft);
         var result = await renderer.PreviewAsync(store.Document, frame, draft,
             Path.Combine(store.RootPath, "Previews"), progress, token);
@@ -127,11 +133,11 @@ public sealed class FrameWorkflow : IDisposable
             || !new[] { ".jpg", ".jpeg", ".png" }.Contains(Path.GetExtension(result.ImagePath).ToLowerInvariant()))
             throw new InvalidDataException("Processor did not return an existing JPG/PNG preview.");
         var ready = draft.PictureCalibration?.IsComplete(draft.FilmKind) == true;
-        return Remember(new(frameId, draft, xmpHash, result.ImagePath, result.SourceImagePath,
+        return new(frameId, draft, xmpHash, result.ImagePath, result.SourceImagePath,
             new[] { prepared.Warning }.OfType<string>().Concat(result.Warnings),
             "Preview rendered for the exact current recipe. " + (ready
-                ? "Inspect it, then accept; any manual edit requires another preview."
-                : $"This frame is uncalibrated. Auto-pick again or pick {RequiredPicks(draft)}; accepting/exporting retains the warning.")));
+                ? "Settings are saved for this frame and used for export."
+                : $"This frame is uncalibrated. Auto-pick again or pick {RequiredPicks(draft)}; export retains the warning."));
     }
 
     public async Task<FramePreview> AutoPickAsync(Guid frameId, IProgress<ProcessingProgress>? progress, CancellationToken token)
@@ -145,11 +151,11 @@ public sealed class FrameWorkflow : IDisposable
         static string Rgb(PictureSample sample) => $"({sample.Red:F3}, {sample.Green:F3}, {sample.Blue:F3})";
         var sampling = $"Automatic picks from frame {frame.Number} (linear RGB): light {Rgb(picks.Light!)}"
             + (picks.FilmBase is { } basis ? $"; film {Rgb(basis)}" : "")
-            + ". Inspect the positive, then accept; manual pickers can override.";
+            + ". Settings saved for this frame; manual pickers can override.";
         progress?.Report(new(frameId, "Picture picks saved", sampling));
         var preview = await PreviewAsync(frameId, progress, token);
-        return Remember(new(frameId, preview.Recipe, preview.XmpHash, preview.PositivePath, preview.SourcePath,
-            preview.Warnings, $"Automatic picks saved for frame {frame.Number} only. Other frames keep their own calibration.", sampling));
+        return new(frameId, preview.Recipe, preview.XmpHash, preview.PositivePath, preview.SourcePath,
+            preview.Warnings, $"Automatic picks saved for frame {frame.Number} only. Other frames keep their own calibration.", sampling);
     }
 
     public async Task<FramePreview> PickAsync(Guid frameId, CalibrationTarget target, double x, double y,
@@ -169,40 +175,19 @@ public sealed class FrameWorkflow : IDisposable
         if (preview.PicksReady)
         {
             token.ThrowIfCancellationRequested();
-            Accept(preview);
             message = "Preview rendered for the exact current recipe. " +
                 (changed.PictureCalibration?.Light?.IsClipped == true
                     ? "Picks saved for this frame only; clipped backlight is marker-only, with WB correction skipped."
                     : "Light and film picks are applied to this frame only.");
         }
-        return Remember(new(frameId, Draft(frameId), preview.XmpHash, preview.PositivePath,
-            preview.SourcePath, preview.Warnings, message, sampling));
-    }
-
-    public DevelopRecipe Accept(FramePreview preview)
-    {
-        ObjectDisposedException.ThrowIf(disposed, this);
-        ArgumentNullException.ThrowIfNull(preview);
-        if (!previews.TryGetValue(preview.FrameId, out var issued) || !ReferenceEquals(issued, preview)
-            || Draft(preview.FrameId) != preview.Recipe)
-            throw new InvalidOperationException("Render a successful preview of this exact recipe and selected frame first.");
-        if (XmpHash(preview.Recipe) != preview.XmpHash)
-        {
-            previews.Remove(preview.FrameId);
-            throw new InvalidOperationException("The imported XMP changed since preview. Render it again before acceptance.");
-        }
-        var accepted = store.SaveRecipe(preview.Recipe, true);
-        currentDraft = drafts[preview.FrameId] = Unaccepted(accepted);
-        previews.Remove(preview.FrameId);
-        return accepted;
+        return new(frameId, Draft(frameId), preview.XmpHash, preview.PositivePath,
+            preview.SourcePath, preview.Warnings, message, sampling);
     }
 
     public async Task<ExportSummary> ExportAsync(IReadOnlyList<Guid> frameIds,
         IProgress<ProcessingProgress>? progress, CancellationToken token, IProgress<ExportProgress>? exportProgress = null)
     {
         ObjectDisposedException.ThrowIf(disposed, this);
-        if (AcceptedSettings() is not { } approvedSettings)
-            throw new InvalidOperationException("No accepted recipe. Render and accept a preview first.");
         var renderer = Processor;
         var candidates = frameIds.Distinct().Select(Frame).OrderBy(c => c.Number).ToArray();
         if (candidates.Length == 0) throw new InvalidOperationException("Select a captured frame.");
@@ -212,44 +197,40 @@ public sealed class FrameWorkflow : IDisposable
         foreach (var frame in candidates)
         {
             token.ThrowIfCancellationRequested();
-            var acceptedRecipe = AcceptedRecipe(frame.Id);
-            if (acceptedRecipe is null)
-            {
-                var prepared = await FrameCalibration.PrepareAsync(Sources, store.Document, frame,
-                    approvedSettings.ForFrame(frame.Id), Path.Combine(store.RootPath, "Working"), token, progress);
-                if (prepared.Warning is { } warning) warnings.Add(warning);
-                acceptedRecipe = store.SaveRecipe(prepared.Recipe, true);
-                currentDraft = drafts[frame.Id] = Unaccepted(acceptedRecipe);
-                previews.Remove(frame.Id);
-            }
-            var previous = store.Document.Exports.LastOrDefault(e => e.FrameId == frame.Id
-                && e.RecipeId == acceptedRecipe.Id && e.RecipeRevision == acceptedRecipe.Revision);
-            if (previous?.State == ExportState.Complete)
-            {
-                if (ValidOutputs(previous.OutputFiles))
-                {
-                    completed++;
-                    continue;
-                }
-                store.RecordExport(new(frame.Id, acceptedRecipe.Id, acceptedRecipe.Revision, ExportState.Failed,
-                    [], "Saved outputs are missing or empty; regenerating in a new folder.", DateTimeOffset.UtcNow));
-            }
+            var recipe = Draft(frame.Id);
+            if (!store.Document.Recipes.Contains(recipe)) recipe = Edit(frame.Id, recipe);
             var outputDirectory = Path.Combine(store.RootPath, "Processing");
             FrameExport Record(ExportState state, IReadOnlyList<string> files, string? error) =>
-                new(frame.Id, acceptedRecipe.Id, acceptedRecipe.Revision, state, files, error, DateTimeOffset.UtcNow);
-            store.RecordExport(Record(ExportState.Processing, [], null));
-            exportProgress?.Report(new("Starting frame export", $"Preparing saved frame {frame.Number}.",
-                $"Batch: {completed}/{candidates.Length} complete, {failed} failed. Exporting frame {frame.Number} with accepted revision {acceptedRecipe.Revision}.",
-                $"Exporting frame {frame.Number}; accepted revision {acceptedRecipe.Revision}; {completed}/{candidates.Length} complete."));
+                new(frame.Id, recipe.Id, recipe.Revision, state, files, error, DateTimeOffset.UtcNow);
             try
             {
+                var prepared = await FrameCalibration.PrepareAsync(Sources, store.Document, frame,
+                    recipe, Path.Combine(store.RootPath, "Working"), token, progress);
+                if (prepared.Warning is { } warning) warnings.Add(warning);
+                if (prepared.Recipe != recipe) recipe = Edit(frame.Id, prepared.Recipe);
+                var previous = store.Document.Exports.LastOrDefault(e => e.FrameId == frame.Id
+                    && e.RecipeId == recipe.Id && e.RecipeRevision == recipe.Revision);
+                if (previous?.State == ExportState.Complete)
+                {
+                    if (ValidOutputs(previous.OutputFiles))
+                    {
+                        completed++;
+                        continue;
+                    }
+                    store.RecordExport(Record(ExportState.Failed, [],
+                        "Saved outputs are missing or empty; regenerating in a new folder."));
+                }
+                store.RecordExport(Record(ExportState.Processing, [], null));
+                exportProgress?.Report(new("Starting frame export", $"Preparing saved frame {frame.Number}.",
+                    $"Batch: {completed}/{candidates.Length} complete, {failed} failed. Exporting frame {frame.Number} with saved revision {recipe.Revision}.",
+                    $"Exporting frame {frame.Number}; saved revision {recipe.Revision}; {completed}/{candidates.Length} complete."));
                 Directory.CreateDirectory(outputDirectory);
-                var result = await renderer.ExportAsync(store.Document, frame, acceptedRecipe, outputDirectory, progress, token);
+                var result = await renderer.ExportAsync(store.Document, frame, recipe, outputDirectory, progress, token);
                 token.ThrowIfCancellationRequested();
                 if (!ValidOutputs(result.OutputFiles))
                     throw new InvalidDataException("Processor did not produce both a nonempty TIFF and JPG.");
                 exportProgress?.Report(new("Publishing positives", $"Moving validated frame {frame.Number} output into the positives folder."));
-                var positives = PublishPositives(frame, acceptedRecipe, result.OutputFiles, token);
+                var positives = PublishPositives(frame, recipe, result.OutputFiles, token);
                 store.RecordExport(Record(ExportState.Complete, positives, null));
                 try { PruneGeneratedImages(Path.GetDirectoryName(result.OutputFiles[0])!); }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -273,15 +254,13 @@ public sealed class FrameWorkflow : IDisposable
             exportProgress?.Report(new(Warnings: Array.AsReadOnly(warnings.ToArray())));
         }
         return new(completed, failed, warnings.AsReadOnly(),
-            $"Batch finished: {completed}/{candidates.Length} complete, {failed} failed. Each frame used its own accepted calibration/settings. Inputs retained; retry missing/failed jobs explicitly.");
+            $"Batch finished: {completed}/{candidates.Length} complete, {failed} failed. Each frame used its own latest saved calibration/settings. Inputs retained; retry missing/failed jobs explicitly.");
     }
-
-    private FramePreview Remember(FramePreview preview) => previews[preview.FrameId] = preview;
 
     private DevelopRecipe EditAndReport(Guid frameId, DevelopRecipe recipe, IProgress<ProcessingProgress>? progress)
     {
         var saved = Edit(frameId, recipe);
-        progress?.Report(new(frameId, "Unaccepted edits", UnacceptedEditsMessage));
+        progress?.Report(new(frameId, "Settings saved", SettingsSavedMessage));
         return saved;
     }
 
@@ -316,7 +295,6 @@ public sealed class FrameWorkflow : IDisposable
         }
     }
 
-    private static DevelopRecipe Unaccepted(DevelopRecipe recipe) => recipe with { Accepted = false, AcceptedAt = null };
     private static string RequiredPicks(DevelopRecipe recipe) => recipe.FilmKind == FilmKind.Positive ? "exposed light" : "exposed light and clear film";
 
     private static string? XmpHash(DevelopRecipe recipe)
@@ -375,7 +353,6 @@ public sealed class FrameWorkflow : IDisposable
         if (disposed) return;
         disposed = true;
         sources?.Dispose();
-        previews.Clear();
         drafts.Clear();
     }
 }
