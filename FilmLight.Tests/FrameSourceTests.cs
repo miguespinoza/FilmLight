@@ -658,6 +658,44 @@ public sealed class FrameSourceTests : IDisposable
         Assert.False(Directory.Exists(Path.Combine(cache, "decode-11.failed")));
     }
 
+    [Theory]
+    [InlineData("partial", false)]
+    [InlineData("partial", true)]
+    [InlineData("failed", false)]
+    [InlineData("failed", true)]
+    public async Task ResumedPreviewIgnoresInaccessibleAbandonedDecodeJobs(string extension, bool locked)
+    {
+        var (roll, frame) = QualifiedRoll();
+        string cache = Path.Combine(root, "camera-input-cache");
+        string abandoned = Path.Combine(cache, $"decode-abandoned.{extension}");
+        Directory.CreateDirectory(abandoned);
+        string input = Path.Combine(abandoned, "input.RAF");
+        File.WriteAllText(input, "abandoned working copy");
+        Directory.SetLastWriteTimeUtc(abandoned, DateTime.UtcNow.AddHours(-2));
+        if (extension == "failed")
+            for (int i = 0; i < 10; i++)
+                Directory.CreateDirectory(Path.Combine(cache, $"decode-newer-{i}.failed"));
+        string removable = Path.Combine(cache, $"decode-removable.{extension}");
+        Directory.CreateDirectory(removable);
+        Directory.SetLastWriteTimeUtc(removable, DateTime.UtcNow.AddHours(-3));
+        using var held = locked ? new FileStream(input, FileMode.Open, FileAccess.Read, FileShare.None) : null;
+        var attributes = File.GetAttributes(abandoned);
+        if (!locked) File.SetAttributes(abandoned, attributes | FileAttributes.ReadOnly);
+        try
+        {
+            using var sources = Sources();
+            var image = await sources.Open(roll, frame).GetImageAsync(1600, default);
+            Assert.Equal(4, image.Width);
+            Assert.True(Directory.Exists(abandoned));
+            if (locked) Assert.True(File.Exists(input));
+            Assert.False(Directory.Exists(removable));
+        }
+        finally
+        {
+            if (Directory.Exists(abandoned)) File.SetAttributes(abandoned, attributes);
+        }
+    }
+
     [RawFact("FILMLIGHT_TEST_RAF")]
     public async Task RealRafInputsReachNegadoctorAndValidatedPositiveExports()
     {

@@ -253,6 +253,7 @@ processing TIFFs are removed; logs, effective recipes and original captures are 
 Preview intermediates and reusable linear decode caches remain available.
 `roll.json`, `captures` and `recipes` retain the acquisition and
 calibration history; **Open / resume** restores the roll.
+Developing and exporting already captured frames do not require a connected camera.
 Roll manifests currently use absolute paths: keep the roll at its original location
 when resuming it.
 
@@ -299,8 +300,10 @@ checks the full image's aspect, dimensions and finite samples against it.
 Validated darktable outputs are published without rewriting or hashing.
 The module retains eight recent proxies and one full image; consumers receive
 defensive copies. Decodes are serialized with queued proxies ahead of full work,
-and canceling a preview does not cancel a shared decode. Old partial jobs are
-removed after an hour; up to ten failed decode jobs are retained for diagnosis.
+and canceling a preview does not cancel a shared decode. Cleanup attempts to remove
+partial jobs older than an hour and retain only ten failed decode jobs for diagnosis.
+Locked or access-denied abandoned jobs are left for a later cleanup attempt with a
+trace warning, rather than blocking previews or exports.
 
 Real exports use uncompressed 16-bit **linear ProPhoto RGB** TIFF masters and
 quality-95, **4:4:4** sRGB JPEG companions with embedded ICC profiles. The TIFF

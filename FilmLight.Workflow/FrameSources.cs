@@ -86,7 +86,7 @@ internal sealed class FrameSources : IDisposable
         if (!Directory.Exists(cache)) return;
         foreach (string directory in Directory.GetDirectories(cache, "decode-*.partial"))
             if (Directory.GetLastWriteTimeUtc(directory) < DateTime.UtcNow.AddHours(-1))
-                Directory.Delete(directory, true);
+                TryDeleteAbandonedJob(directory);
         TrimFailures();
     }
 
@@ -542,7 +542,16 @@ internal sealed class FrameSources : IDisposable
     {
         foreach (var directory in new DirectoryInfo(cache).GetDirectories("decode-*.failed")
             .OrderByDescending(d => d.LastWriteTimeUtc).Skip(10))
-            directory.Delete(true);
+            TryDeleteAbandonedJob(directory.FullName);
+    }
+
+    private static void TryDeleteAbandonedJob(string directory)
+    {
+        try { Directory.Delete(directory, true); }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            System.Diagnostics.Trace.TraceWarning($"Could not remove abandoned RAW decode job {directory}: {error.Message}");
+        }
     }
 
     private static string FileIdentity(string path)
