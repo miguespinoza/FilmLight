@@ -118,6 +118,34 @@ public sealed class ScanSequenceTests
             new(interval), _ => { }, (_, _) => Task.CompletedTask, null, CancellationToken.None));
     }
 
+    [Fact]
+    public async Task RetryDoesNotRecaptureCompletedColors()
+    {
+        var camera = new RetryCamera();
+        var sequence = new ScanSequence(camera: camera);
+        var saved = new List<LightChannel>();
+        Task Run() => sequence.RunAsync(new(1, false, 0), _ => { },
+            (_, _) => Task.CompletedTask, (channel, _) => saved.Add(channel), CancellationToken.None);
+
+        await Assert.ThrowsAsync<IOException>(Run);
+        await Run();
+
+        Assert.Equal([LightChannel.Red, LightChannel.Green, LightChannel.Green, LightChannel.Blue], camera.Attempts);
+        Assert.Equal([LightChannel.Red, LightChannel.Green, LightChannel.Blue], saved);
+    }
+
+    private sealed class RetryCamera : ICameraCapture
+    {
+        public List<LightChannel> Attempts { get; } = [];
+        public Task<CaptureResult> CaptureAsync(LightChannel channel, CancellationToken cancellationToken)
+        {
+            Attempts.Add(channel);
+            return Attempts.Count == 2
+                ? Task.FromException<CaptureResult>(new IOException("USB disconnected"))
+                : Task.FromResult(new CaptureResult([$"{channel}.RAF"]));
+        }
+    }
+
     private static async Task AdvanceUntil(FakeTimeProvider clock, Func<bool> condition, int maximumSteps)
     {
         for (var i = 0; i < maximumSteps && !condition(); i++)

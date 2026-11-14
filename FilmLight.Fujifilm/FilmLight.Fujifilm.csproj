@@ -5,6 +5,7 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
   <ItemGroup>
+    <InternalsVisibleTo Include="FilmLight.Tests" />
     <ProjectReference Include="..\FilmLight.Core\FilmLight.Core.csproj" />
   </ItemGroup>
 </Project>

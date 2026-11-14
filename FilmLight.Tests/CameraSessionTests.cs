@@ -174,6 +174,229 @@ public sealed class CameraSessionTests : IDisposable
     }
 
     [Fact]
+    public void CaptureWaitsForShutterToBecomeIdleAfterLastDownloadBeforeNextChannel()
+    {
+        var native = new FakeCamera();
+        var clock = new FakeTimeProvider();
+        using var session = new CameraSession(native, output, clock, clock.Advance);
+        session.Connect();
+        native.OnDownload = () => native.ReleaseStatus = 0x200;
+        var waits = 0;
+        native.OnValidate = () =>
+        {
+            if (native.Downloads == 2 && ++waits >= 3) native.ReleaseStatus = 0;
+        };
+        session.Capture(LightChannel.Red, Guid.NewGuid().ToString("N"), CancellationToken.None);
+        Assert.True(waits >= 3);
+        Assert.False(session.Faulted);
+        Assert.Equal(1, native.Triggers);
+
+        native.OnDownload = null;
+        native.Shot = [(1, Image(2, 1)), (7, Image(2, 7))];
+        session.Capture(LightChannel.Green, Guid.NewGuid().ToString("N"), CancellationToken.None);
+        Assert.Equal(2, native.Triggers);
+        Assert.Equal(4, native.Downloads);
+    }
+
+    [Fact]
+    public void IdleWindowRestartsWhenShutterBecomesBusyAgainAfterDownloads()
+    {
+        var native = new FakeCamera();
+        var clock = new FakeTimeProvider();
+        using var session = new CameraSession(native, output, clock, clock.Advance);
+        session.Connect();
+        DateTimeOffset? lastBusy = null;
+        var checks = 0;
+        native.OnValidate = () =>
+        {
+            if (native.Downloads != 2) return;
+            checks++;
+            native.ReleaseStatus = checks is 2 or 4 ? 0x200 : 0;
+            if (native.ReleaseStatus != 0) lastBusy = clock.GetUtcNow();
+        };
+        session.Capture(LightChannel.Red, Guid.NewGuid().ToString("N"), CancellationToken.None);
+        Assert.True(checks > 4, "Capture completed before observing the camera's delayed busy status.");
+        Assert.True(clock.GetUtcNow() - lastBusy >= TimeSpan.FromMilliseconds(500));
+        Assert.Equal(1, native.Triggers);
+    }
+
+    [Fact]
+    public void CancellationDuringPreflightBusyWaitNeverTriggersOrFaults()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var native = new FakeCamera();
+        using var session = Create(native);
+        session.Connect();
+        native.OnValidate = () =>
+        {
+            cancellation.Cancel();
+            throw new CameraSdkException("Busy", 0x1006);
+        };
+        Assert.Throws<OperationCanceledException>(() =>
+            session.Capture(LightChannel.Red, Guid.NewGuid().ToString("N"), cancellation.Token));
+        Assert.Equal(0, native.Triggers);
+        Assert.False(session.Faulted);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void PersistentActiveShutterTimesOutWithoutRetriggeringOrPublishing(bool afterTrigger)
+    {
+        var native = new FakeCamera();
+        var clock = new FakeTimeProvider();
+        using var session = new CameraSession(native, output, clock, clock.Advance);
+        session.Connect();
+        var started = clock.GetUtcNow();
+        if (afterTrigger) native.OnDownload = () => native.ReleaseStatus = 0x200;
+        else native.ReleaseStatus = 0x200;
+        var error = Assert.Throws<CameraSdkException>(() =>
+            session.Capture(LightChannel.Red, Guid.NewGuid().ToString("N"), CancellationToken.None));
+        Assert.Contains("deadline", error.Message);
+        Assert.InRange(clock.GetUtcNow() - started,
+            TimeSpan.FromMinutes(2), TimeSpan.FromMinutes(2) + TimeSpan.FromSeconds(1));
+        Assert.Equal(afterTrigger ? 1 : 0, native.Triggers);
+        Assert.True(session.Faulted);
+        Assert.Empty(Directory.GetDirectories(output, "Scan-*"));
+    }
+
+    [Theory]
+    [InlineData(0x1006)]
+    [InlineData(0x1016)]
+    [InlineData(0x1017)]
+    public void BusyFullPressIsNeverRetriedBecauseExposureMayHaveStarted(int errorCode)
+    {
+        var native = new FakeCamera { OnFullPress = () => throw new CameraSdkException("FullPress failed", errorCode) };
+        using var session = Create(native);
+        session.Connect();
+        Assert.Throws<CameraSdkException>(() =>
+            session.Capture(LightChannel.Red, Guid.NewGuid().ToString("N"), CancellationToken.None));
+        Assert.Equal(1, native.Triggers);
+        Assert.True(session.Faulted);
+        Assert.Empty(Directory.GetDirectories(output, "Scan-*"));
+    }
+
+    [Fact]
+    public void CancellationAfterDownloadsStillWaitsForIdleAndPreservesCapture()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var native = new FakeCamera();
+        var clock = new FakeTimeProvider();
+        using var session = new CameraSession(native, output, clock, clock.Advance);
+        session.Connect();
+        native.OnDownload = () =>
+        {
+            if (native.Downloads == 2)
+            {
+                native.ReleaseStatus = 0x200;
+                cancellation.Cancel();
+            }
+        };
+        var checks = 0;
+        native.OnValidate = () =>
+        {
+            if (native.Downloads == 2 && ++checks >= 3) native.ReleaseStatus = 0;
+        };
+        Assert.Throws<OperationCanceledException>(() =>
+            session.Capture(LightChannel.Red, Guid.NewGuid().ToString("N"), cancellation.Token));
+        Assert.True(checks >= 3);
+        Assert.Equal(2, native.Downloads);
+        Assert.Equal(1, native.Triggers);
+        Assert.False(session.Faulted);
+        Assert.Empty(Directory.GetDirectories(output, "Scan-*"));
+        Assert.Single(Directory.GetFiles(Path.Combine(output, "Recovery"), "complete.json", SearchOption.AllDirectories));
+    }
+
+    [Fact]
+    public void IdleMonitoringReportsActiveShutterAsBusyWithoutFaulting()
+    {
+        var native = new FakeCamera();
+        using var session = Create(native);
+        session.Connect();
+        native.ReleaseStatus = 0x200;
+        Assert.False(session.CheckConnection());
+        Assert.False(session.Faulted);
+        native.ReleaseStatus = 0;
+        Assert.True(session.CheckConnection());
+        Assert.Equal(0, native.Triggers);
+    }
+
+    [Theory]
+    [InlineData(0x100)]
+    [InlineData(0x200)]
+    [InlineData(0x400)]
+    public void TransientActiveShutterBeforeTriggerWaitsForStableIdle(int status)
+    {
+        var clock = new FakeTimeProvider();
+        DateTimeOffset? idleAt = null;
+        var native = new FakeCamera
+        {
+            ReleaseStatus = status,
+            OnHalfPress = () => Assert.True(clock.GetUtcNow() - idleAt >= TimeSpan.FromMilliseconds(500))
+        };
+        var progress = new List<CameraActivity>();
+        using var session = new CameraSession(native, output, clock, clock.Advance, progress.Add);
+        session.Connect();
+        var checks = 0;
+        native.OnValidate = () =>
+        {
+            if (++checks == 3)
+            {
+                native.ReleaseStatus = 0;
+                idleAt = clock.GetUtcNow();
+            }
+        };
+        session.Capture(LightChannel.Red, Guid.NewGuid().ToString("N"), CancellationToken.None);
+        Assert.Equal(1, native.Triggers);
+        Assert.Equal(2, native.Downloads);
+        Assert.False(session.Faulted);
+        Assert.Contains(progress, activity => activity.Stage == CameraStage.Busy);
+    }
+
+    [Fact]
+    public void BusyQueueReadRestartsIdleWindowBeforeReturningCapture()
+    {
+        var native = new FakeCamera();
+        var clock = new FakeTimeProvider();
+        using var session = new CameraSession(native, output, clock, clock.Advance);
+        session.Connect();
+        DateTimeOffset? busyAt = null;
+        var checks = 0;
+        native.OnValidate = () =>
+        {
+            if (native.Downloads == 2 && ++checks == 3)
+            {
+                native.BusyReads = 1;
+                busyAt = clock.GetUtcNow();
+            }
+        };
+        session.Capture(LightChannel.Red, Guid.NewGuid().ToString("N"), CancellationToken.None);
+        Assert.NotNull(busyAt);
+        Assert.True(clock.GetUtcNow() - busyAt >= TimeSpan.FromMilliseconds(500));
+        Assert.Equal(1, native.Triggers);
+    }
+
+    [Fact]
+    public void LateUnsolicitedImageDuringIdleWindowFaultsWithoutPublishing()
+    {
+        var native = new FakeCamera();
+        using var session = Create(native);
+        session.Connect();
+        var checks = 0;
+        native.OnValidate = () =>
+        {
+            if (native.Downloads == 2 && ++checks == 3) native.Queue.Enqueue((7, Image(2, 7)));
+        };
+        Assert.Throws<CameraSdkException>(() =>
+            session.Capture(LightChannel.Red, Guid.NewGuid().ToString("N"), CancellationToken.None));
+        Assert.True(session.Faulted);
+        Assert.Equal(1, native.Triggers);
+        Assert.Equal(2, native.Downloads);
+        Assert.Empty(Directory.GetDirectories(output, "Scan-*"));
+        Assert.Single(native.Queue);
+    }
+
+    [Fact]
     public void NativeImageAndDeviceLayoutsMatchPackedSdkAbi()
     {
         Assert.Equal(IntPtr.Size == 8 ? 64 : 60, Marshal.SizeOf<NativeCamera.NativeImageInfo>());
@@ -256,12 +479,20 @@ public sealed class CameraSessionTests : IDisposable
         public int HalfReleases { get; private set; }
         public int BusyReads { get; set; }
         public int Quality { get; init; } = 4;
+        public int ReleaseStatus { get; set; }
+        public Action? OnValidate { get; set; }
+        public Action? OnDownload { get; set; }
         public CameraConnection Connect() => new("X-T5", "test", "test", "test", Quality);
-        public void ValidateConfiguration() { }
+        public void ValidateConfiguration()
+        {
+            OnValidate?.Invoke();
+            NativeCamera.ValidateReleaseStatus(ReleaseStatus);
+        }
         public CameraSdkException? ConnectionError { get; set; }
         public void CheckConnection()
         {
             if (ConnectionError is not null) throw ConnectionError;
+            NativeCamera.ValidateReleaseStatus(ReleaseStatus);
         }
         public ImageInfo ReadImageInfo()
         {
@@ -271,7 +502,12 @@ public sealed class CameraSessionTests : IDisposable
             var head = Queue.Peek();
             return new(head.Format, head.Bytes.Length);
         }
-        public byte[] ReadImage(ImageInfo info) { Downloads++; return Queue.Dequeue().Bytes; }
+        public byte[] ReadImage(ImageInfo info)
+        {
+            Downloads++;
+            OnDownload?.Invoke();
+            return Queue.Dequeue().Bytes;
+        }
         public void HalfPress() => OnHalfPress?.Invoke();
         public void ReleaseHalfPress() => HalfReleases++;
         public void FullPress()

@@ -19,10 +19,10 @@ public interface INativeCamera : IDisposable
     void FullPress();
 }
 
-public sealed class CameraSdkException(string message, int errorCode = 0) : IOException(message)
+public sealed class CameraSdkException(string message, int errorCode = 0, bool isBusy = false) : IOException(message)
 {
     public int ErrorCode { get; } = errorCode;
-    public bool IsBusy => ErrorCode is 0x1006 or 0x1016 or 0x1017;
+    public bool IsBusy => isBusy || ErrorCode is 0x1006 or 0x1016 or 0x1017;
 }
 
 public sealed record CameraRequest(string Id, string Command, string? SdkDirectory = null,

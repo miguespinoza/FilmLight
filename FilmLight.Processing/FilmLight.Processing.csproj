@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="BitMiracle.LibTiff.NET" Version="2.4.660" />
+    <PackageReference Include="StbImageSharp" Version="2.30.16" />
+    <ProjectReference Include="..\FilmLight.Core\FilmLight.Core.csproj" />
+    <EmbeddedResource Include="Templates\*.xmp" />
+    <InternalsVisibleTo Include="FilmLight.Tests" />
+  </ItemGroup>
+</Project>

@@ -44,8 +44,8 @@ public sealed class CameraSession(INativeCamera camera, string outputDirectory,
             cancellationToken.ThrowIfCancellationRequested();
             report?.Invoke(new(CameraStage.Checking, "Checking camera and image queue", channel));
             var preflight = clock.GetTimestamp();
-            ValidateUntilReady(preflight);
-            if (ReadInfoUntilReady(preflight).Format != 5)
+            ValidateUntilReady(preflight, channel, cancellationToken);
+            if (ReadInfoUntilReady(preflight, cancellationToken).Format != 5)
                 throw new CameraSdkException("Unexpected queued image. Reconnect to preserve it in Recovery before capturing.");
             Directory.CreateDirectory(staged);
             WriteDurably(Path.Combine(staged, "transaction.json"), JsonSerializer.SerializeToUtf8Bytes(
@@ -53,6 +53,7 @@ public sealed class CameraSession(INativeCamera camera, string outputDirectory,
             report?.Invoke(new(CameraStage.Settling, "Settling light", channel));
             delay(TimeSpan.FromMilliseconds(250));
             cancellationToken.ThrowIfCancellationRequested();
+            WaitForIdle(preflight, channel, false, cancellationToken);
             halfHeld = true;
             report?.Invoke(new(CameraStage.Triggering, "Triggering shutter \u00b7 camera exposure settings", channel));
             camera.HalfPress();
@@ -68,7 +69,7 @@ public sealed class CameraSession(INativeCamera camera, string outputDirectory,
             uint? shot = null;
             var formats = new HashSet<int>();
             var files = new List<string>();
-            var started = clock.GetTimestamp();
+            var started = preflight;
             var waitingReported = false;
             while (formats.Count < expected.Count)
             {
@@ -105,9 +106,7 @@ public sealed class CameraSession(INativeCamera camera, string outputDirectory,
                 files.Add(fileName);
                 waitingReported = false;
             }
-            if (ReadInfoUntilReady(started).Format != 5)
-                throw new InvalidDataException("Additional unsolicited images appeared. Reconnect before scanning.");
-            ValidateUntilReady(started);
+            WaitForIdle(started, channel, true);
             completedShots.Add(shot!.Value);
             var canceled = cancellationToken.IsCancellationRequested;
             report?.Invoke(new(CameraStage.Saving, canceled ? "Preserving canceled capture in Recovery" : "Committing complete image set", channel));
@@ -161,30 +160,76 @@ public sealed class CameraSession(INativeCamera camera, string outputDirectory,
         }
     }
 
-    private ImageInfo ReadInfoUntilReady(long started)
+    private ImageInfo ReadInfoUntilReady(long started, CancellationToken cancellationToken = default)
     {
         while (true)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             EnsureDeadline(started);
             try { return camera.ReadImageInfo(); }
             catch (CameraSdkException ex) when (ex.IsBusy) { delay(TimeSpan.FromMilliseconds(100)); }
         }
     }
 
-    private void ValidateUntilReady(long started)
+    private void ValidateUntilReady(long started, LightChannel channel, CancellationToken cancellationToken)
     {
+        var busyReported = false;
+        string? lastBusy = null;
         while (true)
         {
-            EnsureDeadline(started);
+            cancellationToken.ThrowIfCancellationRequested();
+            EnsureDeadline(started, lastBusy);
             try { camera.ValidateConfiguration(); return; }
-            catch (CameraSdkException ex) when (ex.IsBusy) { delay(TimeSpan.FromMilliseconds(100)); }
+            catch (CameraSdkException ex) when (ex.IsBusy)
+            {
+                lastBusy = ex.Message;
+                if (!busyReported)
+                {
+                    report?.Invoke(new(CameraStage.Busy, $"Waiting for camera before triggering \u00b7 {ex.Message}", channel));
+                    busyReported = true;
+                }
+                delay(TimeSpan.FromMilliseconds(100));
+            }
         }
     }
 
-    private void EnsureDeadline(long started)
+    private void WaitForIdle(long started, LightChannel channel, bool triggered, CancellationToken cancellationToken = default)
     {
-        if (clock.GetElapsedTime(started) > TimeSpan.FromMinutes(2))
-            throw new TimeoutException("Camera image-arrival/transfer deadline exceeded (2 minutes). Do not reshoot until idle.");
+        long? idleSince = null;
+        string? lastBusy = null;
+        var busyReported = false;
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            EnsureDeadline(started, lastBusy);
+            try
+            {
+                camera.ValidateConfiguration();
+                if (camera.ReadImageInfo().Format != 5)
+                    throw new InvalidDataException("Unexpected queued image. Reconnect to preserve it before scanning.");
+                idleSince ??= clock.GetTimestamp();
+                if (clock.GetElapsedTime(idleSince.Value) >= TimeSpan.FromMilliseconds(500)) return;
+            }
+            catch (CameraSdkException ex) when (ex.IsBusy)
+            {
+                idleSince = null;
+                lastBusy = ex.Message;
+                if (!busyReported)
+                {
+                    report?.Invoke(new(triggered ? CameraStage.WaitingForImage : CameraStage.Busy,
+                        $"Waiting for camera to become idle \u00b7 light held \u00b7 {ex.Message}", channel));
+                    busyReported = true;
+                }
+            }
+            delay(TimeSpan.FromMilliseconds(100));
+        }
+    }
+
+    private void EnsureDeadline(long started, string? lastBusy = null)
+    {
+        if (clock.GetElapsedTime(started) >= TimeSpan.FromMinutes(2))
+            throw new TimeoutException("Camera capture/readiness/transfer deadline exceeded (2 minutes). Do not reshoot until idle." +
+                (lastBusy is null ? "" : $" Last camera status: {lastBusy}"));
     }
 
     private static string Extension(int format) => format switch

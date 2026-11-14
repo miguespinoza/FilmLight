@@ -17,9 +17,11 @@ public interface ICameraCapture
     Task<CaptureResult> CaptureAsync(LightChannel channel, CancellationToken cancellationToken);
 }
 
-public sealed class ScanSequence(TimeProvider? timeProvider = null, ICameraCapture? camera = null)
+public sealed class ScanSequence(TimeProvider? timeProvider = null, ICameraCapture? camera = null,
+    IEnumerable<LightChannel>? completedChannels = null)
 {
     private readonly TimeProvider clock = timeProvider ?? TimeProvider.System;
+    private readonly HashSet<LightChannel> completed = completedChannels?.ToHashSet() ?? [];
 
     public async Task RunAsync(
         ScanOptions options,
@@ -43,6 +45,8 @@ public sealed class ScanSequence(TimeProvider? timeProvider = null, ICameraCaptu
             foreach (var channel in new[] { LightChannel.Red, LightChannel.Green, LightChannel.Blue })
             {
                 cancellationToken.ThrowIfCancellationRequested();
+                if (camera is not null && completed.Contains(channel))
+                    continue;
                 await showLight(channel, cancellationToken);
                 if (camera is null)
                 {
@@ -52,11 +56,13 @@ public sealed class ScanSequence(TimeProvider? timeProvider = null, ICameraCaptu
                 {
                     report(new(ScanPhase.Holding, channel, set, TimeSpan.Zero));
                     var result = await camera.CaptureAsync(channel, cancellationToken);
-                    cancellationToken.ThrowIfCancellationRequested();
                     captureCompleted?.Invoke(channel, result);
+                    completed.Add(channel);
+                    cancellationToken.ThrowIfCancellationRequested();
                 }
             }
             cancellationToken.ThrowIfCancellationRequested();
+            completed.Clear();
             if (!options.Repeat)
                 break;
             set++;

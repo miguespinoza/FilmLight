@@ -95,6 +95,15 @@ try {
     } while ([DateTime]::UtcNow -lt $deadline)
     Wait-Text 'Uniform white' | Write-Output
     Wait-Text 'CAMERA ' | Write-Output
+    foreach ($name in @('New roll', 'Open folder', 'Undo / retake', 'Saved color progress')) {
+        $control = Wait-Control $name
+        if ($control.Current.IsOffscreen) { throw "Bottom roll control is offscreen: $name" }
+        $bounds = $control.Current.BoundingRectangle
+        $windowBounds = $script:window.Current.BoundingRectangle
+        if ($bounds.Top -lt $windowBounds.Top + $windowBounds.Height * 0.65) {
+            throw "Roll control is not in the bottom bar: $name"
+        }
+    }
     Invoke-Button 'Reset'
     Assert-Light 0xFFFFFF
     Invoke-Button ([string][char]0x2212)

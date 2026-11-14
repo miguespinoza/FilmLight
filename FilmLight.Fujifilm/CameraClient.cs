@@ -53,6 +53,13 @@ public sealed class CameraClient : ICameraCapture, IAsyncDisposable
 
     public void BeginScan() => scanId = Guid.NewGuid().ToString("N");
 
+    public void BeginScan(string id)
+    {
+        if (!Guid.TryParseExact(id, "N", out _))
+            throw new ArgumentException("Invalid scan identifier.", nameof(id));
+        scanId = id;
+    }
+
     public async Task CheckConnectionAsync()
     {
         if (Connection is null || Faulted) throw new CameraSdkException("Camera is not connected.");

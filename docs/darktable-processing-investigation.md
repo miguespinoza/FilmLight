@@ -1,5 +1,10 @@
 # darktable-cli + negadoctor processing investigation
 
+> Implementation update (2026-11-08): the version-pinned settings bridge and native
+> processing math have been migrated from PhotoManage into `FilmLight.Processing`.
+> GUI-only calibration and unproven-bridge statements below describe the original
+> investigation. Current behavior and RGB limitations: [processing.md](processing.md).
+
 Date: 2026-11-06
 Baseline: darktable **5.6.2** (tag `release-5.6.2`, commit `20891f6c6fa7be995e5bf9dff9d1ee5062051773`, released 2026-10-04)
 Scope: Can the downloaded X-T5 scan transactions (`Scan-<id>`, white or R/G/B RAF/JPG) be turned headlessly into Lightroom-editable positive masters + JPG with `darktable-cli` and `negadoctor`, after a light-only calibration?

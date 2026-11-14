@@ -19,5 +19,17 @@
     <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.4948" />
     <ProjectReference Include="..\FilmLight.Core\FilmLight.Core.csproj" />
     <ProjectReference Include="..\FilmLight.Fujifilm\FilmLight.Fujifilm.csproj" />
+    <ProjectReference Include="..\FilmLight.Processing\FilmLight.Processing.csproj" />
   </ItemGroup>
+  <!-- Unpackaged publishing omits the merged PRI needed by WinUI control templates. -->
+  <Target Name="PublishAppResourcePri" BeforeTargets="ComputeResolvedFilesToPublishList">
+    <Error Condition="'$(ProjectPriFullPath)' == '' Or !Exists('$(ProjectPriFullPath)')"
+           Text="The app resource index was not generated; publishing without it would crash WinUI controls." />
+    <ItemGroup>
+      <ResolvedFileToPublish Include="$(ProjectPriFullPath)">
+        <RelativePath>$(AssemblyName).pri</RelativePath>
+        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      </ResolvedFileToPublish>
+    </ItemGroup>
+  </Target>
 </Project>

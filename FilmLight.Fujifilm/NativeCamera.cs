@@ -86,6 +86,7 @@ public sealed class NativeCamera : INativeCamera
 
     public void ValidateConfiguration()
     {
+        ValidateReleaseStatus(GetValue("XSDK_GetReleaseStatus"));
         if (GetValue("XSDK_GetPriorityMode") != 1)
             throw new CameraSdkException("Camera priority changed. Reconnect; Film Light will not trigger using PC exposure settings.");
         if (GetValue("XSDK_GetDriveMode") != 4)
@@ -99,10 +100,15 @@ public sealed class NativeCamera : INativeCamera
             throw new CameraSdkException("Image quality changed. Disconnect and reconnect to reconfigure transfers.");
         if (quality != 1 && GetProperty(0x219F) != 7)
             throw new CameraSdkException("Select JPEG, not HEIF, in the camera image-format settings.");
-        if ((GetValue("XSDK_GetReleaseStatus") & (0x200 | 0x400 | 0x100)) != 0)
-            throw new CameraSdkException("Camera shutter controls are active. Wait until the camera is idle.");
         if (mediaChanged && GetValue("XSDK_GetMediaRecord") != (quality == 1 ? 2 : quality is 4 or 5 or 7 ? 1 : 3))
             throw new CameraSdkException("Camera-card recording changed. Reconnect before scanning.");
+    }
+
+    internal static void ValidateReleaseStatus(int status)
+    {
+        if ((status & (0x200 | 0x400 | 0x100)) != 0)
+            throw new CameraSdkException($"Camera shutter controls are active (release status 0x{status:X}). Wait until the camera is idle.",
+                isBusy: true);
     }
 
     public ImageInfo ReadImageInfo()
@@ -114,6 +120,7 @@ public sealed class NativeCamera : INativeCamera
     public void CheckConnection()
     {
         Check(Get<DeviceInfo>("XSDK_GetDeviceInfo")(camera, out _), "Check USB connection");
+        ValidateReleaseStatus(GetValue("XSDK_GetReleaseStatus"));
     }
 
     public byte[] ReadImage(ImageInfo info)

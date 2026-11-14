@@ -25,9 +25,14 @@ Repeated sequences can drift relative to an independent camera timer.
 
 ## USB camera capture
 
-Click **Camera**, select the SDK13410 root folder and a save folder, confirm camera
+Click **Camera**, select the SDK13410 root folder if needed, confirm camera
 setup, then **Connect USB**. The default SDK location is
-`%USERPROFILE%\Downloads\SDK13410`; photos default to `Pictures\FilmLight`.
+`%USERPROFILE%\Downloads\SDK13410`. Film Light automatically creates a unique
+`Roll-<date>-<id>` folder under `Pictures\FilmLight` (or your saved roll location);
+no folder picker is required. **Open folder** opens the current roll in Explorer.
+**New roll** creates another folder without deleting the previous roll's photos.
+A healthy connected camera reconnects to the new roll automatically.
+Changing the roll location affects future rolls only.
 This implementation targets the **Fujifilm X-T5**. Use USB TETHER SHOOTING AUTO,
 manual focus (M), single-shot drive (S), fixed exposure/white balance and a writable
 card. Close other tether apps and do not press the camera shutter during app captures.
@@ -50,10 +55,38 @@ Automatic image downloads remain enabled.
 Connected RGB mode shows **AUTO** instead of interval controls. After the countdown,
 the app settles each color for 250 ms, performs half/full press, waits for the
 camera queue, and downloads the complete selected format set before the next color.
+Before triggering and after the last download, it requires the shutter controls
+to be inactive and the transfer queue to remain empty for 500 ms. Temporary SDK
+busy responses and active shutter status restart that idle window instead of
+faulting the scan; the light stays held while waiting. The idle camera indicator
+also reports active shutter controls as busy, not ready.
 RAW/JPEG partners are checked against their Fujifilm MakerNote shot number.
 White mode also offers **Capture white**.
 
-Completed transactions appear under `Scan-<id>` in the save folder. Each channel has
+In connected RGB mode, **Capture references** saves one RGB reference set for the
+current roll; **Capture frame** saves subsequent RGB sets separately. References
+are optional and are never reset by a camera failure or disconnect. Roll metadata,
+saved references and completed colors are restored when the app restarts.
+After a failed/paused set, **Resume capture** skips already-saved colors and keeps
+the same scan ID. Keep the film position, exposure and lighting settings unchanged
+when resuming. Timer-only mode still starts a fresh set.
+
+The compact bottom progress bar shows the current reference/frame, camera stage,
+and saved RGB colors; it advances only when a color's complete files are saved.
+A horizontal strip adds small labelled thumbnails as each capture arrives,
+including partial frames. JPEG files or the embedded JPEG preview in RAF files
+provide the thumbnails; originals are not modified.
+
+Select a thumbnail and use **Undo / retake** to reject that frame or reference set
+and queue a fresh capture of all its colors. Retaking an older frame keeps its
+frame number and leaves later frames and references intact. **Cancel frame** or
+**Cancel references** stops an active set, waits for an in-flight exposure/download
+to finish, then queues a fresh retake rather than resuming the saved colors.
+Retaking does not trigger the shutter until you press Capture again. Rejected
+captures remain on disk and are marked discarded in `roll.json`, not counted as
+valid frames/references. After a camera fault, re-arm before undoing or capturing.
+
+Completed transactions appear under `Scan-<id>` in the roll folder. Each channel has
 a directory containing original `.RAF`/`.JPG` files and transaction metadata.
 Camera-card recording is enabled for the selected formats and its original setting
 is restored on clean disconnect. Tablet download success does not independently
@@ -64,9 +97,18 @@ The SDK cannot download old files from the camera card itself.
 
 Pause waits for an already-triggered capture and its downloads to finish before
 unlocking light controls. After an uncertain capture/USB error, the light controls
-remain locked. Verify the camera is idle, use **Re-arm** to disconnect, then reconnect.
-There is no automatic retry/reshoot or silent fallback to the timer after a camera fault.
-The queue deadline is two minutes; the helper watchdog is three minutes.
+remain locked. Verify the camera is idle, then use **Re-arm**, confirm idle and
+choose **Reconnect**. You can also choose **Disconnect** without reconnecting.
+Then use **Resume capture**; reference photos and completed colors do not need to
+be captured again. There is no automatic retry/reshoot or silent fallback to the
+timer after a camera fault. A canceled in-flight capture stays in Recovery and is
+not treated as a completed color.
+Cancellation before triggering interrupts busy polling without taking a shot.
+After triggering, cancellation waits for downloads and the idle window before
+unlocking controls. Shutter calls and image downloads are never blindly retried:
+an error may occur after an exposure or queue consumption has already started.
+The full capture deadline (readiness, exposure, transfer and final idle wait) is
+two minutes; the helper watchdog is three minutes.
 Do not use bulb or exposures/processing that exceed those limits.
 
 An x64 helper owns all SDK calls while the WinUI app remains native ARM64.
@@ -76,6 +118,18 @@ the app or repository. Obtain the applicable redistribution agreement before
 shipping SDK binaries. Logs are under `%LOCALAPPDATA%\FilmLight\Logs`.
 See `docs\fujifilm-sdk-investigation.md` for primary-source references and remaining
 hardware acceptance gates.
+
+## Film processing
+
+After capture, choose **Process film** to preview and convert original RAFs using
+the processing pipeline moved from PhotoManage's Negative Lab. Install darktable
+5.6.x separately (`FILMLIGHT_DARKTABLE_CLI` can select its executable).
+Light-source and film-base sampling, per-frame tone/Print Finish, crop/rotation,
+and opt-in batch export produce a 16-bit sRGB TIFF, JPEG and reproducibility record
+under the roll's `Positives` folder. Originals and references remain untouched.
+RGB reconstruction uses the roll's explicit capture sets and references and
+remains **experimental**, with acknowledgement required before export.
+See [processing details and limitations](docs/processing.md).
 
 ## Build and run
 
